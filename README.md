@@ -12,8 +12,27 @@ Exported as `fast-sdf-ao/webgpu` and live at **[webgpu.html](https://wrong-nebul
 - **SHaRC World-Space Hash Cache + 4-Neighbor ReSTIR-GI:** `262,144`-slot atomic world-space hash cache (AO + multi-bounce GI, **100% converged-cell skip** on camera cuts) + `8×8` workgroup shared-memory **4-neighbor ReSTIR-GI** spatial reservoir reuse with midpoint SDF visibility validation
 - **REBLUR-lite + SIGMA-lite 1-SPP Denoising:** Penumbra-guided bilateral shadow filtering (noise-free soft shadows on frame 1), hit-distance-guided `1→2→4` à-trous GI filtering, firefly suppression, and spatio-temporal triangular-PDF dithering
 - **Full-Resolution Mirror Chrome + GGX Glossy SDF Reflections** (`src/webgpu-refl.js`): Exact `1280 × 720` mirror chrome ray tracing on conductors (`rough ≤ 0.08`) + checkerboard GGX rough reflections with virtual-motion parallax reprojection and roughness edge-stopping
-- **Real-Time Dynamic Moving Objects:** Analytic dynamic spheres rendered directly into the G-buffer & Composite passes and evaluated in the SDF — casting real-time soft shadows, contact AO, colored GI bounce, and live reflections with **zero SDF re-baking**
-- **Live Drag-and-Drop `.glb` / `.obj` + In-Browser GPU SDF Baker** (`src/webgpu-bake.js`): Drop any `.glb`, `.gltf`, or `.obj` onto `webgpu.html` to import full **PBR `metalness` & `roughness`** materials and bake an exact `96 × 96 × 56` FP16 SDF directly on the WebGPU GPU (zero CPU readback)
+- **Arbitrary-Mesh Moving Objects** (`src/webgpu-movers.js`): up to 8 rigid movers per frame, each an instance of any registered triangle mesh (or an exact analytic sphere). Every mesh gets a local-space binned-SAH BLAS in the contact-BVH node format; GI/AO rays, sun & orb shadow rays, half-res glossy reflections and full-res mirror reflections are transformed into each mover's local space and traced **exactly against its triangles** — real-time shadows, contact AO, colored GI bounce, and reflections with **zero SDF re-baking**
+- **Live Drag-and-Drop `.glb` / `.obj` + In-Browser GPU SDF Baker** (`src/webgpu-bake.js`): Drop any `.glb`, `.gltf`, or `.obj` onto `webgpu.html` to import full **PBR `metalness` & `roughness`** materials and bake an exact `96 × 96 × 56` FP16 SDF directly on the WebGPU GPU (zero CPU readback), or tick **Drop as mover** to turn it into an orbiting, ray-traced moving object instead
+
+#### Moving objects (WebGPU)
+
+```js
+import { WebGPUFastSDFAO } from 'fast-sdf-ao/webgpu';
+
+const gpu = await WebGPUFastSDFAO.create(canvas);
+// Register a mesh once (local space, Z-up). Builds the exact BLAS on the CPU; colors/roughness optional.
+const teapot = gpu.addMoverMesh({ positions, normals, indices, colors, roughness });
+// Every frame: rigid instances (column-major local->world matrix, or pos / rotation quaternion / scale).
+gpu.dynObjects = [
+  { mesh: teapot, matrix: object3D.matrixWorld.elements, color: [0.95, 0.36, 0.22], roughness: 0.55 },
+  { pos: [1, 0, 1.2], radius: 0.3, color: [0.98, 0.8, 0.36], roughness: -0.04 }, // analytic sphere (default mesh)
+];
+gpu.render(eye, target);
+// gpu.removeMoverMesh(teapot) frees it; objects that still reference it are skipped.
+```
+
+Movers are rigid (no skinning or deformation). They are excluded from the SHaRC hash and the radiance volume, so while any mover is present the hash is bypassed and the volume does not see them: off-screen mover hits are shaded with unshadowed sun + sky, and movers do not occlude light inside the volume's own 2-bounce gather.
 
 #### 1-Bounce Diffuse GI Head-to-Head (`benchmark/bench_gi_compare.py`, Apple M1, `1280 × 720`, 512-Ray Reference)
 

@@ -6,6 +6,7 @@
 //   4. loadSDF round-trip on assets/atrium.f16.gz
 //   5. buildContactBVH on non-box curved Atrium geometry
 //   6. bin/bake-sdf.mjs --help + small OBJ bake with --validate 200
+//   7. WebGPU mover BLAS (src/webgpu-movers.js): exact traversal vs brute force after packing
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -23,6 +24,14 @@ import {
   buildContactBVH,
   CONTACT_GLSL,
 } from '../src/index.js';
+import {
+  buildMoverBLAS,
+  packMoverBLAS,
+  invertMat4,
+  composeMat4,
+  moverTraceWGSL,
+  moverUniformWGSL,
+} from '../src/webgpu-movers.js';
 import {
   ATRIUM_SDF_DIMS,
   ATRIUM_SDF_MIN,
@@ -183,6 +192,141 @@ try {
   console.log(`   OK (32^3 FP16 bake in ${stats.ms.total.toFixed(1)} ms, 200/200 brute-force exact)`);
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true });
+}
+
+console.log('7. Testing WebGPU mover BLAS exactness (CPU port of the WGSL traversal vs brute force)...');
+{
+  // Two meshes packed into shared buffers so index rebasing is exercised: a 2-triangle single-leaf
+  // mesh followed by the curved 13,704-triangle Atrium.
+  const tiny = { positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1]), indices: null };
+  const atrium = { positions: atriumData.positions, indices: atriumData.indices };
+  const meshes = [tiny, atrium];
+  const tb0 = performance.now();
+  const blas = meshes.map(m => buildMoverBLAS(m.positions, m.indices));
+  const blasMs = performance.now() - tb0;
+  const { nodes, tris } = packMoverBLAS(blas);
+  assert.equal(blas[0].single, true);
+  assert.equal(blas[1].triCount, atriumData.triangleCount);
+  assert.equal(blas[1].nodeBase, blas[0].nodeCount);
+  assert.equal(blas[1].triBase, blas[0].triCount);
+
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const triHit = (v0, e1, e2, o, d, tMin, tMax) => {
+    const h = cross(d, e2), det = dot(e1, h);
+    if (Math.abs(det) < 1e-12) return -1;
+    const inv = 1 / det, s = sub(o, v0), u = dot(s, h) * inv;
+    if (u < 0 || u > 1) return -1;
+    const q = cross(s, e1), v = dot(d, q) * inv;
+    if (v < 0 || u + v > 1) return -1;
+    const t = dot(e2, q) * inv;
+    return t > tMin && t < tMax ? t : -1;
+  };
+  const triVec = (i) => [tris[i * 4], tris[i * 4 + 1], tris[i * 4 + 2]];
+  const node = (i) => [nodes[i * 4], nodes[i * 4 + 1], nodes[i * 4 + 2], nodes[i * 4 + 3]];
+  const box = (nd, qInv, qOff, tMax) => {
+    const lo = [nd[0] & 0xFFFF, nd[0] >>> 16, nd[1] & 0xFFFF], hi = [nd[1] >>> 16, nd[2] & 0xFFFF, nd[2] >>> 16];
+    let t0 = 0, t1 = tMax;
+    for (let k = 0; k < 3; k++) {
+      const a = lo[k] * qInv[k] + qOff[k], b = hi[k] * qInv[k] + qOff[k];
+      t0 = Math.max(t0, Math.min(a, b));
+      t1 = Math.min(t1, Math.max(a, b));
+    }
+    return t1 >= t0 ? t0 : -1;
+  };
+  const leaf = (info, o, d, tMin, st) => {
+    const first = (info & 0x7FFFFFFF) >>> 3;
+    let hit = false;
+    for (let j = 0; j < (info & 7); j++) {
+      const t3 = (first + j) * 3;
+      const t = triHit(triVec(t3), triVec(t3 + 1), triVec(t3 + 2), o, d, tMin, st.best);
+      if (t > 0) { st.best = t; hit = true; }
+    }
+    return hit;
+  };
+  let maxStack = 0;
+  // Mirrors mvBLAS() in src/webgpu-movers.js (stack of 32, nearest-first, leaf-tightened siblings).
+  const traverse = (b, o, d, tMin, tMax) => {
+    const inv = d.map(x => 1 / (Math.abs(x) < 1e-12 ? 1e-12 : x));
+    const qInv = b.qScale.map((s, k) => s * inv[k]), qOff = b.qMin.map((m, k) => (m - o[k]) * inv[k]);
+    const st = { best: tMax };
+    let found = false;
+    if (b.single) {
+      const nd = node(b.nodeBase);
+      if (box(nd, qInv, qOff, st.best) >= 0) found = leaf(nd[3], o, d, tMin, st);
+      return found ? st.best : -1;
+    }
+    const stack = [];
+    let pair = b.nodeBase;
+    for (let visit = 0; visit < 4096; visit++) {
+      const L = node(pair), R = node(pair + 1);
+      const tL = box(L, qInv, qOff, st.best), tR = box(R, qInv, qOff, st.best);
+      let hL = tL >= 0, hR = tR >= 0;
+      if (hL && (L[3] & 0x80000000)) { if (leaf(L[3], o, d, tMin, st)) found = true; hL = false; }
+      if (hR && (R[3] & 0x80000000)) { if (leaf(R[3], o, d, tMin, st)) found = true; hR = false; }
+      hL = hL && tL <= st.best;
+      hR = hR && tR <= st.best;
+      if (hL && hR) {
+        assert.ok(stack.length < 32, 'mover BLAS traversal stack overflow');
+        stack.push(tL <= tR ? R[3] : L[3]);
+        maxStack = Math.max(maxStack, stack.length);
+        pair = tL <= tR ? L[3] : R[3];
+        continue;
+      }
+      if (hL) { pair = L[3]; continue; }
+      if (hR) { pair = R[3]; continue; }
+      if (!stack.length) break;
+      pair = stack.pop();
+    }
+    return found ? st.best : -1;
+  };
+  const brute = (m, o, d, tMin, tMax) => {
+    const n = m.indices ? m.indices.length / 3 : m.positions.length / 9;
+    const P = (i) => [m.positions[i * 3], m.positions[i * 3 + 1], m.positions[i * 3 + 2]];
+    let best = -1, bt = tMax;
+    for (let t = 0; t < n; t++) {
+      const a = P(m.indices ? m.indices[t * 3] : t * 3);
+      const b = P(m.indices ? m.indices[t * 3 + 1] : t * 3 + 1);
+      const c = P(m.indices ? m.indices[t * 3 + 2] : t * 3 + 2);
+      const h = triHit(a, sub(b, a), sub(c, a), o, d, tMin, bt);
+      if (h > 0) { bt = h; best = h; }
+    }
+    return best;
+  };
+  let seed = 12345;
+  const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+  let rays = 0, hits = 0, mismatches = 0;
+  meshes.forEach((m, mi) => {
+    const b = blas[mi];
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < m.positions.length; i++) { lo[i % 3] = Math.min(lo[i % 3], m.positions[i]); hi[i % 3] = Math.max(hi[i % 3], m.positions[i]); }
+    for (let k = 0; k < (mi === 0 ? 400 : 1200); k++) {
+      const o = lo.map((l, a) => l - 0.5 * (hi[a] - l) + rnd() * 2 * (hi[a] - l));
+      const tgt = lo.map((l, a) => l + rnd() * (hi[a] - l));
+      let d = sub(tgt, o);
+      const len = Math.hypot(...d);
+      d = d.map(x => x / len);
+      const tMax = rnd() < 0.3 ? rnd() * len * 1.5 : 1e4;
+      const a = traverse(b, o, d, 0.002, tMax), c = brute(m, o, d, 0.002, tMax);
+      rays++;
+      if (c > 0) hits++;
+      if ((a > 0) !== (c > 0) || (a > 0 && Math.abs(a - c) > 1e-5 * Math.max(1, c))) mismatches++;
+    }
+  });
+  assert.equal(mismatches, 0, `mover BLAS disagreed with brute force on ${mismatches}/${rays} rays`);
+  assert.ok(hits > rays * 0.3, 'mover BLAS test rays should mostly hit');
+
+  const M = composeMat4([1, 2, 3], [0.2, 0.3, 0.1, Math.sqrt(1 - 0.14)], [0.5, 2, 1.5]);
+  const I = invertMat4(M);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let v = 0;
+    for (let k = 0; k < 4; k++) v += I[k * 4 + r] * M[c * 4 + k];
+    assert.ok(Math.abs(v - (c === r ? 1 : 0)) < 1e-5, 'invertMat4(composeMat4()) must be identity');
+  }
+  const wgsl = moverUniformWGSL(1) + moverTraceWGSL(2, 3);
+  for (const fn of ['fn traceMovers', 'fn moversOccluded', 'fn mvBLAS', 'fn mvNormalToWorld', 'array<u32, 32>']) assert.ok(wgsl.includes(fn), fn);
+  console.log(`   OK (${rays} rays, ${hits} hits, 0 mismatches, max stack ${maxStack}/32, ${blas[1].nodeCount.toLocaleString()} nodes, BLAS ${blasMs.toFixed(1)} ms)`);
 }
 
 console.log('\nAll package Node tests PASSED!');

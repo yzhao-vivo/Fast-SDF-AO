@@ -1,7 +1,10 @@
 // Real-Time Glossy / Rough SDF Specular Reflections for WebGPU Compute:
 // - 1 GGX-importance-sampled reflection ray per half-res pixel (roughness < 0.72)
 // - Hybrid trace: Storage-buffer Dual-Child SAH BVH2 (near contact) -> FP16 SDF (far) -> radVol + direct Emissive Orb hit
+// - Exact hits on arbitrary-mesh moving objects (per-mesh local BLAS, see webgpu-movers.js)
 // - Temporal reprojection EMA + roughness-guided 3x3 bilateral spatial filter
+
+import { moverUniformWGSL, moverTraceWGSL } from './webgpu-movers.js';
 
 export const REFL_TRACE_WGSL = /* wgsl */`
 struct ReflU {
@@ -18,8 +21,6 @@ struct ReflU {
   rootMin: vec4<f32>,
   rootSpan: vec4<f32>,
   extra: vec4<u32>,         // x=nodeCount, y=enabled(0/1), z=flags(bit0=checker,bit1=useBvh), w=maxSteps
-  dynPosRad: array<vec4<f32>, 4>,
-  dynColRough: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> u: ReflU;
@@ -35,6 +36,8 @@ struct ReflU {
 @group(0) @binding(10) var histAOGI: texture_2d<f32>;
 @group(0) @binding(11) var metaTex: texture_2d<f32>;
 @group(0) @binding(12) var outRefl: texture_storage_2d<rgba16float, write>;
+${moverUniformWGSL(13)}
+${moverTraceWGSL(14, 15)}
 
 fn ign(q: vec2<f32>) -> f32 {
   return fract(52.9829189 * fract(dot(q, vec2<f32>(0.06711056, 0.00583715))));
@@ -62,21 +65,13 @@ fn vdc3(n_in: u32) -> f32 {
   return r;
 }
 
+// Static scene SDF only: moving objects are traced exactly through traceMovers().
 fn sampleSDF(p: vec3<f32>) -> f32 {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
-  var d = 1e4;
   if (all(uv >= vec3<f32>(0.0)) && all(uv <= vec3<f32>(1.0))) {
-    d = textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+    return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
   }
-  if ((u.extra.z & 4u) != 0u) {
-    for (var i = 0u; i < 4u; i++) {
-      let pr = u.dynPosRad[i];
-      if (pr.w > 0.0) {
-        d = min(d, length(p - pr.xyz) - pr.w);
-      }
-    }
-  }
-  return d;
+  return 1e4;
 }
 
 fn sampleRad(p: vec3<f32>) -> vec3<f32> {
@@ -86,21 +81,9 @@ fn sampleRad(p: vec3<f32>) -> vec3<f32> {
 }
 
 // Project exact 3D hit point into the current G-buffer: if visible on screen and facing the ray,
-// shade with crisp pixel-resolution albedo + direct sun/orb + GI (eliminating 12.5 cm radVol blockiness);
-// otherwise seamlessly fall back to 360-degree 2-bounce radVol!
-fn evalHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
-  if ((u.extra.z & 4u) != 0u) {
-    for (var i = 0u; i < 4u; i++) {
-      let pr = u.dynPosRad[i];
-      if (pr.w > 0.0 && abs(length(hitP - pr.xyz) - pr.w) < 0.06) {
-        let hn = normalize(hitP - pr.xyz);
-        let sDir = normalize(u.sunDir.xyz);
-        let sun = max(0.0, dot(hn, sDir));
-        let skyT = clamp(hn.z * 0.5 + 0.5, 0.0, 1.0);
-        return u.dynColRough[i].rgb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
-      }
-    }
-  }
+// shade with crisp pixel-resolution albedo + direct sun/orb + GI (eliminating 12.5 cm radVol blockiness).
+// Returns .a = 1 on success, .a = 0 when the caller must fall back.
+fn screenHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec4<f32> {
   let clip = u.curViewProj * vec4<f32>(hitP, 1.0);
   if (clip.w > 0.1) {
     let ndc = clip.xy / clip.w;
@@ -127,12 +110,29 @@ fn evalHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
               col += halb * u.emissiveCol.rgb * (2.6 * ndlO * clamp(mt.y, 0.0, 1.0) / (0.28 + d2));
             }
           }
-          return max(col, vec3<f32>(0.0));
+          return vec4<f32>(max(col, vec3<f32>(0.0)), 1.0);
         }
       }
     }
   }
+  return vec4<f32>(0.0);
+}
+
+// Static-scene hit: G-buffer when visible, else the 360-degree 2-bounce radVol.
+fn evalHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  let s = screenHitRadiance(hitP, rayDir);
+  if (s.a > 0.5) { return s.rgb; }
   return sampleRad(hitP);
+}
+
+// Exact moving-object hit: G-buffer when visible, else direct sun + sky on the exact hit normal.
+fn evalMoverHitRadiance(hitP: vec3<f32>, hn: vec3<f32>, alb: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  let s = screenHitRadiance(hitP, rayDir);
+  if (s.a > 0.5) { return s.rgb; }
+  let sDir = normalize(u.sunDir.xyz);
+  let sun = max(0.0, dot(hn, sDir));
+  let skyT = clamp(hn.z * 0.5 + 0.5, 0.0, 1.0);
+  return alb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
 }
 
 fn boxHit(nd: vec4<u32>, qInv: vec3<f32>, qOff: vec3<f32>, tMax: f32) -> f32 {
@@ -359,6 +359,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       s += select(max(d * 0.85, 0.035), d * 1.15, d > 0.28);
       if (s > u.params.w) { break; }
     }
+  }
+
+  // 3) Exact moving-object meshes in front of the static hit / orb
+  let mh = traceMovers(origin, R, 0.002, min(hitDist, orbT));
+  if (mh.t > 0.0) {
+    hitAny = true;
+    hitDist = mh.t;
+    rad = evalMoverHitRadiance(origin + R * mh.t, mh.n, mh.alb, R);
   }
 
   if (orbT < hitDist) {

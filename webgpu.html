@@ -57,6 +57,7 @@ canvas{display:block;width:100%;height:auto}
     <label><input id="reuse" type="checkbox" checked> 2×2 Reuse</label>
     <label><input id="emissive" type="checkbox"> Emissive Orb</label>
     <label><input id="movers" type="checkbox"> Moving Objects</label>
+    <label title="Dropped .glb/.obj files become an orbiting, ray-traced moving object instead of replacing the scene"><input id="drop-mover" type="checkbox"> Drop as mover</label>
     <label>Sun <input id="sun" type="range" min="-65" max="65" value="22" step="1" style="width:90px"><span id="sun-val" style="min-width:32px">22°</span></label>
     <button id="clear">Clear Cache</button>
   </nav>
@@ -73,6 +74,7 @@ import * as T from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { buildContactBVH } from './contact-bvh.js';
 import { WebGPUFastSDFAO, WEBGPU_QUALITY_PRESETS } from './src/webgpu.js';
 
@@ -157,14 +159,46 @@ try {
   let sunDeg = 22;
   let simTime = 0, lastNow = 0;
 
+  // Arbitrary-mesh movers: geometry is registered once in local space (exact BLAS built on the CPU),
+  // then instanced every frame with a rigid transform. Z-up, centered, longest side = targetSize.
+  function geometryToMoverMesh(geometry, targetSize) {
+    const g = geometry.clone();
+    g.rotateX(Math.PI / 2);
+    g.computeBoundingBox();
+    const c = g.boundingBox.getCenter(new T.Vector3());
+    const size = g.boundingBox.getSize(new T.Vector3());
+    g.translate(-c.x, -c.y, -c.z);
+    g.scale(...Array(3).fill(targetSize / Math.max(size.x, size.y, size.z)));
+    if (!g.attributes.normal) g.computeVertexNormals();
+    return {
+      positions: new Float32Array(g.attributes.position.array),
+      normals: new Float32Array(g.attributes.normal.array),
+      indices: g.index ? new Uint32Array(g.index.array) : null,
+    };
+  }
+  const teapotMesh = gpu.addMoverMesh(geometryToMoverMesh(new TeapotGeometry(1, 10), 0.62));
+  const knotMesh = gpu.addMoverMesh(geometryToMoverMesh(new T.TorusKnotGeometry(0.5, 0.16, 200, 28), 0.56));
+  let customMoverId = null;
+  const moverMat = new T.Matrix4(), moverQuat = new T.Quaternion(), moverEuler = new T.Euler();
+  function moverMatrix(pos, rx, ry, rz) {
+    moverQuat.setFromEuler(moverEuler.set(rx, ry, rz));
+    return moverMat.compose(new T.Vector3(...pos), moverQuat, new T.Vector3(1, 1, 1)).elements.slice();
+  }
+
   function updateMovers(t) {
     if (!moversOn) { gpu.dynObjects = []; return; }
-    const a1 = t * 1.05;
-    const a2 = a1 + Math.PI;
+    // Three movers phase-locked 120 degrees apart on one collision-free elevated orbit around the pedestal
+    const a1 = t * 1.05, a2 = a1 + (2 * Math.PI) / 3, a3 = a1 + (4 * Math.PI) / 3;
+    const orbit = (a, h, dh) => [1.80 * Math.cos(a), -0.15 + 1.36 * Math.sin(a), h + dh * Math.sin(a * 2.0)];
     gpu.dynObjects = [
-      // Collision-free elevated orbit around the central pedestal: polished mirror-gold sphere + coral matte sphere
-      { pos: [1.82 * Math.cos(a1), -0.15 + 1.38 * Math.sin(a1), 1.18 + 0.30 * Math.sin(a1 * 2.0)], radius: 0.33, color: [0.98, 0.80, 0.36], roughness: -0.04 },
-      { pos: [1.78 * Math.cos(a2), -0.15 + 1.34 * Math.sin(a2), 1.02 + 0.24 * Math.cos(a2 * 2.0)], radius: 0.28, color: [0.95, 0.30, 0.18], roughness: 0.65 },
+      // Polished mirror-gold analytic sphere (reflects the mesh movers through exact ray tracing)
+      { pos: orbit(a1, 1.18, 0.30), radius: 0.33, color: [0.98, 0.80, 0.36], roughness: -0.04 },
+      // Spinning coral teapot (or a dropped .glb/.obj when "Drop as mover" is on)
+      customMoverId !== null
+        ? { mesh: customMoverId, matrix: moverMatrix(orbit(a2, 1.10, 0.22), 0, 0, t * 0.9) }
+        : { mesh: teapotMesh, matrix: moverMatrix(orbit(a2, 1.06, 0.22), 0.25 * Math.sin(t * 1.3), 0, t * 1.4), color: [0.95, 0.36, 0.22], roughness: 0.55 },
+      // Tumbling jade torus knot
+      { mesh: knotMesh, matrix: moverMatrix(orbit(a3, 1.14, 0.26), t * 0.8, t * 0.5, t * 0.3), color: [0.22, 0.78, 0.58], roughness: 0.32 },
     ];
   }
 
@@ -276,14 +310,16 @@ try {
   document.querySelector('#clear').onclick = () => gpu.clearHash();
 
   // ---- Drag-and-Drop .glb / .obj + Live In-Browser WebGPU Compute SDF Baker ----
-  async function loadCustomThreeObject(rootObj, label) {
-    statusEl.value = `Normalizing ${label} & baking exact FP16 SDF on WebGPU…`;
+  // Flatten a Three.js object into Z-up arrays with PBR colors/roughness. The longest side becomes
+  // targetSize; the model rests on z = 0 (scene import) or is centered on the origin (mover import).
+  function gatherThreeObject(rootObj, targetSize, centered) {
     rootObj.updateWorldMatrix(true, true);
     const box = new T.Box3().setFromObject(rootObj);
     const size = box.getSize(new T.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z, 1e-4);
-    const scale = 4.2 / maxDim;
+    const scale = targetSize / maxDim;
     const center = box.getCenter(new T.Vector3());
+    const zBase = centered ? center.y : box.min.y;
 
     const pos = [], nor = [], col = [], rough = [], idx = [];
     const v = new T.Vector3(), nrm = new T.Vector3(), nMat = new T.Matrix3();
@@ -311,7 +347,7 @@ try {
         // Convert Y-up (glTF/OBJ convention) to Z-up viewer convention, resting on z = 0
         const wx = (v.x - center.x) * scale;
         const wy = -(v.z - center.z) * scale;
-        const wz = (v.y - box.min.y) * scale;
+        const wz = (v.y - zBase) * scale;
         pos.push(wx, wy, wz);
         nrm.fromBufferAttribute(nAttr, i).applyMatrix3(nMat).normalize();
         nor.push(nrm.x, -nrm.z, nrm.y);
@@ -327,6 +363,32 @@ try {
         for (let i = 0; i < pAttr.count; i++) idx.push(base + i);
       }
     });
+    return { pos, nor, col, rough, idx, metalTris, glossyTris };
+  }
+
+  async function loadCustomMover(rootObj, label) {
+    statusEl.value = `Building exact mover BLAS for ${label}…`;
+    const { pos, nor, col, rough, idx } = gatherThreeObject(rootObj, 0.7, true);
+    if (idx.length < 3) throw Error(`No triangles found in ${label}`);
+    const t0 = performance.now();
+    const id = gpu.addMoverMesh({
+      positions: new Float32Array(pos), normals: new Float32Array(nor), indices: new Uint32Array(idx),
+      colors: new Float32Array(col), roughness: new Float32Array(rough),
+    });
+    const blasMs = performance.now() - t0;
+    if (customMoverId !== null) gpu.removeMoverMesh(customMoverId);
+    customMoverId = id;
+    moversOn = true;
+    document.querySelector('#movers').checked = true;
+    updateMovers(simTime);
+    statusEl.value = `MOVER (${label}) · ${(idx.length / 3).toLocaleString()} tris · exact local BLAS built in ${blasMs.toFixed(1)} ms · traced by GI, AO, shadows & reflections`;
+    return { triangles: idx.length / 3, blasMs, meshId: id };
+  }
+
+  async function loadCustomThreeObject(rootObj, label) {
+    if (document.querySelector('#drop-mover').checked) return loadCustomMover(rootObj, label);
+    statusEl.value = `Normalizing ${label} & baking exact FP16 SDF on WebGPU…`;
+    const { pos, nor, col, rough, idx, metalTris, glossyTris } = gatherThreeObject(rootObj, 4.2, false);
     if (idx.length < 3) throw Error(`No triangles found in ${label}`);
 
     // Add a subtle polished studio floor slab under the dropped model so it casts crisp contact shadows & reflections
@@ -446,6 +508,8 @@ try {
       return loadCustomThreeObject(obj, name);
     },
     loadCustomThreeObject,
+    loadCustomMoverOBJ: async (objText, name = 'mover.obj') => loadCustomMover(new OBJLoader().parse(objText), name),
+    moverMeshes: { teapot: teapotMesh, knot: knotMesh },
     setMovers: (on, t = 0.6) => {
       moversOn = !!on;
       document.querySelector('#movers').checked = moversOn;

@@ -5,11 +5,16 @@
 // - WGSL Compute GPU 64x64x40 Radiance Grid Relight + 2-Bounce Propagation + Floating Emissive Orb
 // - Real-Time Glossy / Rough SDF Specular Reflections (GGX BVH2 -> SDF -> radVol + direct Emissive Orb hit)
 // - Live In-Browser WebGPU Compute Exact-BVH SDF Baker (pack2x16float -> r16float 3D texture)
+// - Arbitrary-mesh rigid moving objects (per-mesh local BLAS, exact ray tracing in every pass)
 
 import { bakeSDFOnGPU } from './webgpu-bake.js';
 import { REFL_TRACE_WGSL, REFL_FILTER_WGSL } from './webgpu-refl.js';
+import {
+  MAX_MOVERS, MOVER_STRIDE_FLOATS, MOVER_UBO_BYTES, MOVER_KIND_BVH, MOVER_KIND_SPHERE,
+  moverUniformWGSL, moverTraceWGSL, buildMoverBLAS, packMoverBLAS, computeVertexNormals, composeMat4, invertMat4,
+} from './webgpu-movers.js';
 
-export { bakeSDFOnGPU };
+export { bakeSDFOnGPU, MAX_MOVERS, composeMat4 };
 
 export const WEBGPU_QUALITY_PRESETS = {
   very_low:  { label: 'Very Low (Mobile)',  rays: 1, maxSamples: 32,  denoisePasses: 1, giSteps: 8,  giMaxDist: 6.0,  shadowSteps: 24, multiBounce: false, reflEnabled: false, reflChecker: true,  reflUseBvh: false, reflSteps: 12, reflRoughCut: 0.24 },
@@ -29,18 +34,15 @@ const GBUFFER_WGSL = /* wgsl */`
 struct CamU {
   viewProj: mat4x4<f32>,
   view: mat4x4<f32>,
-  dynPosRad: array<vec4<f32>, 4>,
-  dynColRough: array<vec4<f32>, 4>,
+  eye: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> cam: CamU;
+${moverUniformWGSL(1)}
 
 struct VIn {
   @location(0) pos: vec3<f32>,
   @location(1) nor: vec3<f32>,
   @location(2) colRough: vec4<f32>,
-};
-struct DynVIn {
-  @location(0) pos: vec3<f32>,
 };
 struct VOut {
   @builtin(position) clip: vec4<f32>,
@@ -59,16 +61,15 @@ struct VOut {
   o.viewZ = -(cam.view * wp).z;
   return o;
 }
-@vertex fn vsDyn(v: DynVIn, @builtin(instance_index) inst: u32) -> VOut {
+// Moving object: mesh vertices in local space, instance_index (= firstInstance) selects the mover.
+@vertex fn vsMover(v: VIn, @builtin(instance_index) inst: u32) -> VOut {
   var o: VOut;
-  let pr = cam.dynPosRad[inst];
-  let cr = cam.dynColRough[inst];
-  let wpos = pr.xyz + v.pos * pr.w;
-  let wp = vec4<f32>(wpos, 1.0);
+  let m = mv.m[inst];
+  let wp = m.l2w * vec4<f32>(v.pos, 1.0);
   o.clip = cam.viewProj * wp;
-  o.wPos = wpos;
-  o.wNor = normalize(v.pos);
-  o.colRough = cr;
+  o.wPos = wp.xyz;
+  o.wNor = mvNormalToWorld(inst, v.nor);
+  o.colRough = vec4<f32>(v.colRough.rgb * m.colRough.rgb, select(v.colRough.a, m.colRough.a, m.info.w != 0u));
   o.viewZ = -(cam.view * wp).z;
   return o;
 }
@@ -77,11 +78,15 @@ struct GOut {
   @location(1) normal: vec4<f32>,
   @location(2) albedo: vec4<f32>,
 };
-@fragment fn fs(i: VOut) -> GOut {
+@fragment fn fs(i: VOut, @builtin(front_facing) front: bool) -> GOut {
   var o: GOut;
   o.posDepth = vec4<f32>(i.wPos, i.viewZ);
   let isMetal = select(0.0, 1.0, i.colRough.a < 0.0);
-  o.normal = vec4<f32>(normalize(i.wNor), 1.0 + isMetal);
+  // Movers are drawn two-sided (open meshes, mirrored transforms): flip the normal of a back face
+  // only when it also points away from the viewer, so either winding convention shades correctly.
+  var nrm = normalize(i.wNor);
+  if (!front && dot(nrm, cam.eye.xyz - i.wPos) < 0.0) { nrm = -nrm; }
+  o.normal = vec4<f32>(nrm, 1.0 + isMetal);
   o.albedo = vec4<f32>(i.colRough.rgb, abs(i.colRough.a));
   return o;
 }
@@ -346,8 +351,6 @@ struct TraceU {
   extra: vec4<u32>,         // x=shadowSteps, y=tableMask, z=flags(bit0=reuse,bit1=traceSh,bit2=multiBounce,bits8..15=giSteps), w=bvhNodeCount
   rootMin: vec4<f32>,
   rootSpan: vec4<f32>,
-  dynPosRad: array<vec4<f32>, 4>,
-  dynColRough: array<vec4<f32>, 4>,
 };
 
 struct HashEntry {
@@ -381,6 +384,11 @@ struct HitRec {
 @group(0) @binding(12) var<storage, read_write> stats: array<atomic<u32>>;
 @group(0) @binding(13) var gAlbedoRough: texture_2d<f32>;
 @group(0) @binding(14) var prevHistMeta: texture_2d<f32>;
+${moverUniformWGSL(15)}
+${moverTraceWGSL(16, 17)}
+
+// Self-intersection guard for exact mover hits (rays leave their own surface with a 0.5 mm bias).
+const MV_TMIN: f32 = 0.002;
 
 var<workgroup> sharedHits: array<HitRec, 64>;
 
@@ -426,42 +434,13 @@ fn hashCell(cx: i32, cy: i32, cz: i32, nCode: u32, lod: u32) -> vec2<u32> {
   return vec2<u32>(h1, h2);
 }
 
+// Static scene SDF only: moving objects are traced exactly through traceMovers()/moversOccluded().
 fn sampleSDF(p: vec3<f32>) -> f32 {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
-  var d = 1e4;
   if (all(uv >= vec3<f32>(0.0)) && all(uv <= vec3<f32>(1.0))) {
-    d = textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+    return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
   }
-  if ((u.extra.z & 8u) != 0u) {
-    for (var i = 0u; i < 4u; i++) {
-      let pr = u.dynPosRad[i];
-      if (pr.w > 0.0) {
-        d = min(d, length(p - pr.xyz) - pr.w);
-      }
-    }
-  }
-  return d;
-}
-
-fn evalDynSphereRad(p: vec3<f32>) -> vec4<f32> {
-  if ((u.extra.z & 8u) == 0u) { return vec4<f32>(0.0); }
-  for (var i = 0u; i < 4u; i++) {
-    let pr = u.dynPosRad[i];
-    if (pr.w > 0.0) {
-      let rel = p - pr.xyz;
-      let dist = length(rel);
-      if (abs(dist - pr.w) < 0.07) {
-        let hn = rel / max(dist, 1e-4);
-        let alb = u.dynColRough[i].rgb;
-        let sDir = normalize(u.sunDirScale.xyz);
-        let ndl = max(0.0, dot(hn, sDir));
-        let skyF = 0.42 + 0.32 * max(0.0, hn.z);
-        var rad = alb * (vec3<f32>(3.10, 2.90, 2.55) * ndl + vec3<f32>(0.56, 0.64, 0.76) * skyF);
-        return vec4<f32>(rad, 1.0);
-      }
-    }
-  }
-  return vec4<f32>(0.0);
+  return 1e4;
 }
 
 fn sampleRad(p: vec3<f32>) -> vec3<f32> {
@@ -470,50 +449,71 @@ fn sampleRad(p: vec3<f32>) -> vec3<f32> {
   return textureSampleLevel(radVol, linSamp, uv, 0.0).rgb * u.sunDirScale.w;
 }
 
-// Hybrid Screen-Space + World radVol Diffuse GI Hit Evaluation:
-// Projects bounce hitP into the half-res G-buffer for sub-centimeter triangle-sharp albedo, normal,
-// sun shadow & emissive orb radiance (zero 11cm voxel light leak!), falling back seamlessly to
-// 360-deg world-space radVol for off-screen, back-facing, or occluded hits!
-fn evalGIHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
-  let dynR = evalDynSphereRad(hitP);
-  if (dynR.a > 0.5) { return dynR.rgb; }
+// Screen-space hit shading: projects a bounce hit into the half-res G-buffer for sub-centimeter
+// triangle-sharp albedo, normal, sun shadow & emissive orb radiance. Returns .a = 1 when the hit is
+// on screen, matches the G-buffer surface and faces the ray; .a = 0 otherwise.
+fn screenHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec4<f32> {
   let clip = u.viewProj * vec4<f32>(hitP, 1.0);
-  if (clip.w > 0.1 && u.params.z > 0.5) {
-    let ndc = clip.xy / clip.w;
-    if (abs(ndc.x) < 0.99 && abs(ndc.y) < 0.99) {
-      let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-      let iq = clamp(vec2<i32>(uv * u.params.xy), vec2<i32>(0), vec2<i32>(u.params.xy) - 1);
-      let gpd = textureLoad(gPosDepth, iq, 0);
-      let gnr = textureLoad(gNormal, iq, 0);
-      if (gpd.w > 0.0 && gnr.w > 0.5 && length(gpd.xyz - hitP) < 0.12) {
-        let hn = normalize(gnr.xyz);
-        if (dot(hn, -rayDir) > 0.02) {
-          let halb = textureLoad(gAlbedoRough, iq, 0).rgb;
-          let mt = textureLoad(prevHistMeta, iq, 0);
-          let sDir = normalize(u.sunDirScale.xyz);
-          let ndl = max(0.0, dot(hn, sDir));
-          let sunSh = clamp(mt.x, 0.0, 1.0);
-          let skyF = 0.42 + 0.32 * max(0.0, hn.z);
-          var rad = halb * (vec3<f32>(3.10, 2.90, 2.55) * ndl * sunSh + vec3<f32>(0.56, 0.64, 0.76) * skyF);
-          if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
-            let toO = u.emissivePos.xyz - hitP;
-            let d2 = dot(toO, toO);
-            let dist = sqrt(d2);
-            let ndlO = max(0.0, dot(hn, toO / max(dist, 1e-4)));
-            if (ndlO > 0.001 && dist < 7.0) {
-              rad += halb * u.emissiveCol.rgb * (2.8 * ndlO * clamp(mt.y, 0.0, 1.0) / (0.32 + d2));
-            }
-          }
-          // When multi-bounce is enabled, blend in 2nd-bounce energy from radVolB
-          if ((u.extra.z & 4u) != 0u) {
-            rad = max(rad, sampleRad(hitP));
-          }
-          return max(rad, vec3<f32>(0.0));
-        }
-      }
+  if (clip.w <= 0.1 || u.params.z < 0.5) { return vec4<f32>(0.0); }
+  let ndc = clip.xy / clip.w;
+  if (abs(ndc.x) >= 0.99 || abs(ndc.y) >= 0.99) { return vec4<f32>(0.0); }
+  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let iq = clamp(vec2<i32>(uv * u.params.xy), vec2<i32>(0), vec2<i32>(u.params.xy) - 1);
+  let gpd = textureLoad(gPosDepth, iq, 0);
+  let gnr = textureLoad(gNormal, iq, 0);
+  if (gpd.w <= 0.0 || gnr.w < 0.5 || length(gpd.xyz - hitP) >= 0.12) { return vec4<f32>(0.0); }
+  let hn = normalize(gnr.xyz);
+  if (dot(hn, -rayDir) <= 0.02) { return vec4<f32>(0.0); }
+  let halb = textureLoad(gAlbedoRough, iq, 0).rgb;
+  let mt = textureLoad(prevHistMeta, iq, 0);
+  let sDir = normalize(u.sunDirScale.xyz);
+  let ndl = max(0.0, dot(hn, sDir));
+  let sunSh = clamp(mt.x, 0.0, 1.0);
+  let skyF = 0.42 + 0.32 * max(0.0, hn.z);
+  var rad = halb * (vec3<f32>(3.10, 2.90, 2.55) * ndl * sunSh + vec3<f32>(0.56, 0.64, 0.76) * skyF);
+  if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
+    let toO = u.emissivePos.xyz - hitP;
+    let d2 = dot(toO, toO);
+    let dist = sqrt(d2);
+    let ndlO = max(0.0, dot(hn, toO / max(dist, 1e-4)));
+    if (ndlO > 0.001 && dist < 7.0) {
+      rad += halb * u.emissiveCol.rgb * (2.8 * ndlO * clamp(mt.y, 0.0, 1.0) / (0.32 + d2));
     }
   }
+  return vec4<f32>(max(rad, vec3<f32>(0.0)), 1.0);
+}
+
+// Hybrid Screen-Space + World radVol Diffuse GI Hit Evaluation for static-scene hits: G-buffer
+// shading when visible (zero 11cm voxel light leak), else the 360-deg world-space radVol.
+fn evalGIHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  let s = screenHitRadiance(hitP, rayDir);
+  if (s.a > 0.5) {
+    // When multi-bounce is enabled, blend in 2nd-bounce energy from radVolB
+    if ((u.extra.z & 4u) != 0u) { return max(s.rgb, sampleRad(hitP)); }
+    return s.rgb;
+  }
   return sampleRad(hitP);
+}
+
+// Radiance leaving an exact moving-object hit: the G-buffer when the hit is on screen, else direct
+// sun + sky (+ orb) on the exact hit normal and albedo. Movers are not in radVol, so never sample it.
+fn evalMoverHitRadiance(hitP: vec3<f32>, hn: vec3<f32>, alb: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  let s = screenHitRadiance(hitP, rayDir);
+  if (s.a > 0.5) { return s.rgb; }
+  let sDir = normalize(u.sunDirScale.xyz);
+  let ndl = max(0.0, dot(hn, sDir));
+  let skyF = 0.42 + 0.32 * max(0.0, hn.z);
+  var rad = alb * (vec3<f32>(3.10, 2.90, 2.55) * ndl + vec3<f32>(0.56, 0.64, 0.76) * skyF);
+  if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
+    let toO = u.emissivePos.xyz - hitP;
+    let d2 = dot(toO, toO);
+    let dist = sqrt(d2);
+    let ndlO = max(0.0, dot(hn, toO / max(dist, 1e-4)));
+    if (ndlO > 0.001 && dist < 7.0) {
+      rad += alb * u.emissiveCol.rgb * (2.8 * ndlO / (0.32 + d2));
+    }
+  }
+  return rad;
 }
 
 fn boxHit(nd: vec4<u32>, qInv: vec3<f32>, qOff: vec3<f32>, tMax: f32) -> f32 {
@@ -625,6 +625,8 @@ fn sdfSunShadow(pos: vec3<f32>, nor: vec3<f32>, sDir: vec3<f32>, px: vec2<f32>, 
   let ang = 6.2831853 * u2;
   let dir = normalize(sDir + st * (rad * cos(ang)) + sb * (rad * sin(ang)));
   let ro = pos + nor * 0.028 + dir * 0.015;
+  // Exact any-hit against moving objects (soft penumbra from the jittered solar disk + temporal filter)
+  if (moversOccluded(ro, dir, 0.0, 10.5)) { return 0.0; }
   var t = 0.012 + 0.055 * fract(ign(px + vec2<f32>(7.0, 41.0)) + vdc2(frame + 17u));
   var res = 1.0;
   let steps = max(u.extra.x, 28u);
@@ -660,6 +662,7 @@ fn sdfPointShadow(pos: vec3<f32>, nor: vec3<f32>, lp: vec3<f32>, rLim: f32, px: 
   let ro = pos + nor * 0.025 + lDir * 0.012;
   var t = 0.012 + 0.045 * fract(ign(px + vec2<f32>(13.0, 47.0)) + vdc2(frame + 23u));
   let tMax = dist - rLim * 0.35 - 0.02;
+  if (moversOccluded(ro, lDir, 0.0, tMax)) { return 0.0; }
   var res = 1.0;
   for (var s = 0u; s < 36u; s++) {
     let d = sampleSDF(ro + lDir * t);
@@ -826,6 +829,7 @@ fn main(
     var visSum = 0.0;
     var giSum = vec3<f32>(0.0);
     var hitDistSum = 0.0;
+    let mvCount = mv.count.x;
     var bestShare = HitRec(vec4<f32>(0.0, 0.0, 0.0, -1.0), vec4<f32>(0.0), vec4<f32>(0.0, 0.0, 0.0, 1.0));
 
     for (var i = 0u; i < 4u; i++) {
@@ -913,6 +917,23 @@ fn main(
           }
         } else if (i == 0u && v < 0.5) {
           bestShare = HitRec(vec4<f32>(p + w * tMinD, tMinD), vec4<f32>(-w, 1.0), vec4<f32>(0.0, 0.0, 0.0, v));
+        }
+      }
+
+      // Exact closest hit against moving-object meshes, up to the static hit (GI) or the AO radius.
+      // A mover in front of the static hit takes over visibility, hit distance and bounce radiance.
+      if (mvCount > 0u && (useGI || v > 0.0)) {
+        let mh = traceMovers(origin, w, MV_TMIN, select(1.12, rayHitT, useGI));
+        if (mh.t > 0.0) {
+          if (mh.t < 1.12) { v = 0.0; }
+          rayHitT = mh.t;
+          let mhP = origin + w * mh.t;
+          if (useGI) {
+            rad = evalMoverHitRadiance(mhP, mh.n, mh.alb, w);
+            if (i == 0u) { bestShare = HitRec(vec4<f32>(mhP, mh.t), vec4<f32>(mh.n, 1.0), vec4<f32>(rad, v)); }
+          } else if (i == 0u) {
+            bestShare = HitRec(vec4<f32>(mhP, mh.t), vec4<f32>(mh.n, 1.0), vec4<f32>(0.0));
+          }
         }
       }
       visSum += v;
@@ -1262,8 +1283,6 @@ struct CompU {
   screen: vec4<f32>,      // x=W, y=H, z=aoW, w=aoH
   sdfMin: vec4<f32>,      // xyz=sdfMin, w=radScale
   sdfInvSpan: vec4<f32>,  // xyz=sdfInvSpan, w=useReflections(0/1)
-  dynPosRad: array<vec4<f32>, 4>,
-  dynColRough: array<vec4<f32>, 4>,
 };
 @group(0) @binding(0) var<uniform> u: CompU;
 @group(0) @binding(1) var aoGITex: texture_2d<f32>;
@@ -1275,14 +1294,13 @@ struct CompU {
 @group(0) @binding(7) var radVol: texture_3d<f32>;
 @group(0) @binding(8) var gAlbedoRough: texture_2d<f32>;
 @group(0) @binding(9) var linSamp: sampler;
+${moverUniformWGSL(10)}
+${moverTraceWGSL(11, 12)}
 
 struct VIn {
   @location(0) pos: vec3<f32>,
   @location(1) nor: vec3<f32>,
   @location(2) colRough: vec4<f32>,
-};
-struct DynVIn {
-  @location(0) pos: vec3<f32>,
 };
 struct VOut {
   @builtin(position) clip: vec4<f32>,
@@ -1298,15 +1316,14 @@ struct VOut {
   o.colRough = v.colRough;
   return o;
 }
-@vertex fn vsDyn(v: DynVIn, @builtin(instance_index) inst: u32) -> VOut {
+@vertex fn vsMover(v: VIn, @builtin(instance_index) inst: u32) -> VOut {
   var o: VOut;
-  let pr = u.dynPosRad[inst];
-  let cr = u.dynColRough[inst];
-  let wpos = pr.xyz + v.pos * pr.w;
-  o.clip = u.viewProj * vec4<f32>(wpos, 1.0);
-  o.wPos = wpos;
-  o.wNor = normalize(v.pos);
-  o.colRough = cr;
+  let m = mv.m[inst];
+  let wp = m.l2w * vec4<f32>(v.pos, 1.0);
+  o.clip = u.viewProj * wp;
+  o.wPos = wp.xyz;
+  o.wNor = mvNormalToWorld(inst, v.nor);
+  o.colRough = vec4<f32>(v.colRough.rgb * m.colRough.rgb, select(v.colRough.a, m.colRough.a, m.info.w != 0u));
   return o;
 }
 
@@ -1333,19 +1350,41 @@ fn ignComp(q: vec2<f32>) -> f32 {
 
 fn compSampleSDF(p: vec3<f32>) -> f32 {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
-  var d = 1e4;
   if (all(uv >= vec3<f32>(0.0)) && all(uv <= vec3<f32>(1.0))) {
-    d = textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
+    return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
   }
-  if (u.dynPosRad[0].w > 0.0) {
-    for (var i = 0u; i < 4u; i++) {
-      let pr = u.dynPosRad[i];
-      if (pr.w > 0.0) {
-        d = min(d, length(p - pr.xyz) - pr.w);
-      }
+  return 1e4;
+}
+
+// Shade a reflection hit from the half-res G-buffer (.a = 1) when it is on screen and faces the ray.
+fn compScreenRad(hitP: vec3<f32>, R: vec3<f32>) -> vec4<f32> {
+  let clip = u.viewProj * vec4<f32>(hitP, 1.0);
+  if (clip.w <= 0.1) { return vec4<f32>(0.0); }
+  let ndc = clip.xy / clip.w;
+  if (abs(ndc.x) >= 0.995 || abs(ndc.y) >= 0.995) { return vec4<f32>(0.0); }
+  let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let iq = clamp(vec2<i32>(uv * u.screen.zw), vec2<i32>(0), vec2<i32>(u.screen.zw) - 1);
+  let gpd = textureLoad(gPosDepth, iq, 0);
+  let gnr = textureLoad(gNormal, iq, 0);
+  if (gpd.w <= 0.0 || gnr.w < 0.5 || length(gpd.xyz - hitP) >= 0.14) { return vec4<f32>(0.0); }
+  let hn = normalize(gnr.xyz);
+  if (dot(hn, -R) <= 0.02) { return vec4<f32>(0.0); }
+  let halb = textureLoad(gAlbedoRough, iq, 0).rgb;
+  let ag = textureLoad(aoGITex, iq, 0);
+  let mt = textureLoad(metaTex, iq, 0);
+  let sDir = normalize(u.sunDir.xyz);
+  let sun = max(0.0, dot(hn, sDir)) * clamp(mt.x, 0.0, 1.0);
+  var col = halb * (vec3<f32>(2.25, 2.10, 1.85) * sun + max(ag.rgb, vec3<f32>(0.0)) + vec3<f32>(0.08, 0.09, 0.11) * clamp(ag.a, 0.0, 1.0));
+  if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
+    let toO = u.emissivePos.xyz - hitP;
+    let d2 = dot(toO, toO);
+    let dist = sqrt(d2);
+    let ndlO = max(0.0, dot(hn, toO / max(dist, 1e-4)));
+    if (ndlO > 0.001 && dist < 7.5) {
+      col += halb * u.emissiveCol.rgb * (2.6 * ndlO * clamp(mt.y, 0.0, 1.0) / (0.28 + d2));
     }
   }
-  return d;
+  return vec4<f32>(max(col, vec3<f32>(0.0)), 1.0);
 }
 
 fn compSampleRad(p: vec3<f32>) -> vec3<f32> {
@@ -1386,6 +1425,17 @@ fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
     s += max(d * 0.85, 0.025);
     if (s > 10.5) { break; }
   }
+  // Exact moving-object hit in front of the static hit / orb
+  let mh = traceMovers(ro, R, 0.002, min(hitDist, orbT));
+  if (mh.t > 0.0) {
+    let mp = ro + R * mh.t;
+    let sc = compScreenRad(mp, R);
+    if (sc.a > 0.5) { return sc.rgb; }
+    let sDir = normalize(u.sunDir.xyz);
+    let sun = max(0.0, dot(mh.n, sDir));
+    let skyT = clamp(mh.n.z * 0.5 + 0.5, 0.0, 1.0);
+    return mh.alb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
+  }
   if (orbT < hitDist) { return u.emissiveCol.rgb * 1.9; }
   if (!hitAny) {
     let skyT = clamp(R.z * 0.5 + 0.5, 0.0, 1.0);
@@ -1397,55 +1447,17 @@ fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
     return mix(vec3<f32>(0.22, 0.24, 0.28), vec3<f32>(0.62, 0.72, 0.88), skyT) + sunDisc + keyBox + rimBox + softBox;
   }
   let hitP = ro + R * hitDist;
-  if (u.dynPosRad[0].w > 0.0) {
-    for (var i = 0u; i < 4u; i++) {
-      let pr = u.dynPosRad[i];
-      if (pr.w > 0.0 && abs(length(hitP - pr.xyz) - pr.w) < 0.05) {
-        let hn = normalize(hitP - pr.xyz);
-        let sDir = normalize(u.sunDir.xyz);
-        let sun = max(0.0, dot(hn, sDir));
-        let skyT = clamp(hn.z * 0.5 + 0.5, 0.0, 1.0);
-        return u.dynColRough[i].rgb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
-      }
-    }
-  }
-  let clip = u.viewProj * vec4<f32>(hitP, 1.0);
-  if (clip.w > 0.1) {
-    let ndc = clip.xy / clip.w;
-    if (abs(ndc.x) < 0.995 && abs(ndc.y) < 0.995) {
-      let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-      let iq = clamp(vec2<i32>(uv * u.screen.zw), vec2<i32>(0), vec2<i32>(u.screen.zw) - 1);
-      let gpd = textureLoad(gPosDepth, iq, 0);
-      let gnr = textureLoad(gNormal, iq, 0);
-      if (gpd.w > 0.0 && gnr.w > 0.5 && length(gpd.xyz - hitP) < 0.14) {
-        let hn = normalize(gnr.xyz);
-        if (dot(hn, -R) > 0.02) {
-          let halb = textureLoad(gAlbedoRough, iq, 0).rgb;
-          let ag = textureLoad(aoGITex, iq, 0);
-          let mt = textureLoad(metaTex, iq, 0);
-          let sDir = normalize(u.sunDir.xyz);
-          let sun = max(0.0, dot(hn, sDir)) * clamp(mt.x, 0.0, 1.0);
-          var col = halb * (vec3<f32>(2.25, 2.10, 1.85) * sun + max(ag.rgb, vec3<f32>(0.0)) + vec3<f32>(0.08, 0.09, 0.11) * clamp(ag.a, 0.0, 1.0));
-          if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) > 1e-4) {
-            let toO = u.emissivePos.xyz - hitP;
-            let d2 = dot(toO, toO);
-            let dist = sqrt(d2);
-            let ndlO = max(0.0, dot(hn, toO / max(dist, 1e-4)));
-            if (ndlO > 0.001 && dist < 7.5) {
-              col += halb * u.emissiveCol.rgb * (2.6 * ndlO * clamp(mt.y, 0.0, 1.0) / (0.28 + d2));
-            }
-          }
-          return max(col, vec3<f32>(0.0));
-        }
-      }
-    }
-  }
+  let sc = compScreenRad(hitP, R);
+  if (sc.a > 0.5) { return sc.rgb; }
   return compSampleRad(hitP);
 }
 
-@fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
+@fragment fn fs(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
   let p = i.wPos;
-  let n = normalize(i.wNor);
+  // Movers are drawn two-sided: flip a back face's normal when it points away from the viewer
+  // (static geometry is back-face culled, so this never triggers there).
+  var n = normalize(i.wNor);
+  if (!front && dot(n, u.eye.xyz - p) < 0.0) { n = -n; }
   let alb = i.colRough.rgb;
   let isMetal = select(0.0, 1.0, i.colRough.a < 0.0);
   let rough = clamp(abs(i.colRough.a), 0.03, 1.0);
@@ -1785,13 +1797,18 @@ export class WebGPUFastSDFAO {
     this.emissivePos = [1.2, 1.0, 1.8];
     this.emissiveCol = [0, 0, 0];
     this.emissiveRadius = 0.20;
-    this.dynObjects = []; // Up to 4 dynamic spheres: [{ pos:[x,y,z], radius, color:[r,g,b], roughness }]
+    // Up to MAX_MOVERS rigid moving objects, re-read every frame:
+    //   { mesh: id from addMoverMesh() (default: built-in analytic sphere),
+    //     matrix: column-major local->world 4x4  OR  pos:[x,y,z], rotation:[qx,qy,qz,qw], scale: s | [sx,sy,sz],
+    //     radius (sphere shorthand for scale), color:[r,g,b] tint, roughness (overrides the mesh; < 0 = metal) }
+    this.dynObjects = [];
     this._relightTick = 0;
     this.lastGpuMs = 0;
     this.lastSkipPct = 0;
     this.sceneRes = null;
     this._initPipelines();
     this._initSharedTargets();
+    this._initMovers();
   }
 
   static async create(canvas, opts = {}) {
@@ -1827,7 +1844,6 @@ export class WebGPUFastSDFAO {
     };
 
     const gMod = d.createShaderModule({ code: GBUFFER_WGSL });
-    const dynVLayout = { arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] };
     this.gPipe = d.createRenderPipeline({
       layout: 'auto',
       vertex: { module: gMod, entryPoint: 'vs', buffers: [vLayout] },
@@ -1839,15 +1855,16 @@ export class WebGPUFastSDFAO {
       primitive: { topology: 'triangle-list', cullMode: 'back' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     });
-    this.dynGPipe = d.createRenderPipeline({
+    // Moving objects: same vertex layout, per-instance transform, drawn two-sided (open/mirrored meshes)
+    this.moverGPipe = d.createRenderPipeline({
       layout: 'auto',
-      vertex: { module: gMod, entryPoint: 'vsDyn', buffers: [dynVLayout] },
+      vertex: { module: gMod, entryPoint: 'vsMover', buffers: [vLayout] },
       fragment: {
         module: gMod,
         entryPoint: 'fs',
         targets: [{ format: 'rgba32float' }, { format: 'rgba16float' }, { format: 'rgba8unorm' }],
       },
-      primitive: { topology: 'triangle-list', cullMode: 'back' },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     });
 
@@ -1881,11 +1898,11 @@ export class WebGPUFastSDFAO {
       primitive: { topology: 'triangle-list', cullMode: 'back' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     });
-    this.dynCompPipe = d.createRenderPipeline({
+    this.moverCompPipe = d.createRenderPipeline({
       layout: 'auto',
-      vertex: { module: cpMod, entryPoint: 'vsDyn', buffers: [dynVLayout] },
+      vertex: { module: cpMod, entryPoint: 'vsMover', buffers: [vLayout] },
       fragment: { module: cpMod, entryPoint: 'fs', targets: [{ format: this.format }] },
-      primitive: { topology: 'triangle-list', cullMode: 'back' },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     });
 
@@ -1960,6 +1977,152 @@ export class WebGPUFastSDFAO {
     }
     this._statsMapped = false;
     this._tsMapped = false;
+  }
+
+  _initMovers() {
+    this.moverUBuf = this.device.createBuffer({ size: MOVER_UBO_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this._moverData = new ArrayBuffer(MOVER_UBO_BYTES);
+    this.moverMeshes = new Map();
+    this._nextMoverId = 0;
+    this.moverNodesBuf = null;
+    this.moverTrisBuf = null;
+    this.activeMoverCount = 0;
+    // Built-in mesh 0: analytic unit sphere (exact ray/sphere test, tessellated only for raster).
+    const sph = makeUnitSphereMesh(48, 28);
+    this.SPHERE_MESH = this._registerMoverMesh({
+      kind: MOVER_KIND_SPHERE, positions: sph.pos, normals: sph.pos, indices: sph.idx,
+      center: [0, 0, 0], radius: 1, blas: null,
+    });
+    this._packMovers();
+  }
+
+  /**
+   * Register a rigid mesh that moving objects (`dynObjects[i].mesh`) can instance. Positions/normals
+   * are in the mesh's local space; colors (per-vertex rgb, default white) and roughness (per-vertex,
+   * negative = metal, default 0.5) feed both raster and traced hits. Builds an exact local BLAS.
+   * @returns {number} mesh id
+   */
+  addMoverMesh({ positions, normals = null, indices = null, colors = null, roughness = null }) {
+    if (!positions || positions.length < 9) throw Error('addMoverMesh: positions must hold at least one triangle');
+    const vCount = positions.length / 3;
+    const idx = indices ? (indices instanceof Uint32Array ? indices : Uint32Array.from(indices)) : null;
+    const nor = normals || computeVertexNormals(positions, idx);
+    let triColors = null;
+    if (colors) {
+      const triCount = idx ? idx.length / 3 : vCount / 3;
+      triColors = new Float32Array(triCount * 3);
+      for (let t = 0; t < triCount; t++) {
+        for (let v = 0; v < 3; v++) {
+          const vi = idx ? idx[t * 3 + v] : t * 3 + v;
+          for (let k = 0; k < 3; k++) triColors[t * 3 + k] += colors[vi * 3 + k] / 3;
+        }
+      }
+    }
+    const blas = buildMoverBLAS(positions, idx, triColors);
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < vCount; i++) {
+      for (let k = 0; k < 3; k++) {
+        lo[k] = Math.min(lo[k], positions[i * 3 + k]);
+        hi[k] = Math.max(hi[k], positions[i * 3 + k]);
+      }
+    }
+    const center = lo.map((v, k) => 0.5 * (v + hi[k]));
+    let r2 = 0;
+    for (let i = 0; i < vCount; i++) {
+      const dx = positions[i * 3] - center[0], dy = positions[i * 3 + 1] - center[1], dz = positions[i * 3 + 2] - center[2];
+      r2 = Math.max(r2, dx * dx + dy * dy + dz * dz);
+    }
+    const id = this._registerMoverMesh({
+      kind: MOVER_KIND_BVH, positions, normals: nor, indices: idx, colors, roughness,
+      center, radius: Math.sqrt(r2), blas,
+    });
+    this._packMovers();
+    return id;
+  }
+
+  removeMoverMesh(id) {
+    const mesh = this.moverMeshes.get(id);
+    if (!mesh || id === this.SPHERE_MESH) return;
+    mesh.vb.destroy();
+    mesh.ib.destroy();
+    this.moverMeshes.delete(id);
+    this._packMovers();
+  }
+
+  _registerMoverMesh({ kind, positions, normals, indices, colors = null, roughness = null, center, radius, blas }) {
+    const d = this.device;
+    const vCount = positions.length / 3;
+    const inter = new Float32Array(vCount * 10);
+    for (let i = 0; i < vCount; i++) {
+      inter.set([positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2], normals[i * 3], normals[i * 3 + 1], normals[i * 3 + 2]], i * 10);
+      inter[i * 10 + 6] = colors ? colors[i * 3] : 1;
+      inter[i * 10 + 7] = colors ? colors[i * 3 + 1] : 1;
+      inter[i * 10 + 8] = colors ? colors[i * 3 + 2] : 1;
+      inter[i * 10 + 9] = roughness ? roughness[i] : 0.5;
+    }
+    const idx = indices || Uint32Array.from({ length: vCount }, (_, i) => i);
+    const vb = d.createBuffer({ size: inter.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(vb, 0, inter);
+    const ib = d.createBuffer({ size: Math.ceil(idx.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(ib, 0, idx);
+    const id = this._nextMoverId++;
+    this.moverMeshes.set(id, {
+      id, kind, vb, ib, indexCount: idx.length, center, radius, blas,
+      root: 0, single: blas ? blas.single : true,
+      qMin: blas ? blas.qMin : [0, 0, 0], qScale: blas ? blas.qScale : [0, 0, 0],
+      triangles: blas ? blas.triCount : idx.length / 3,
+    });
+    return id;
+  }
+
+  // Concatenate all mesh BLASes into the shared storage buffers and rebase their roots.
+  _packMovers() {
+    const d = this.device;
+    const meshes = [...this.moverMeshes.values()].filter(m => m.blas);
+    const packed = packMoverBLAS(meshes.map(m => m.blas));
+    for (const m of meshes) m.root = m.blas.nodeBase;
+    if (this.moverNodesBuf) this.moverNodesBuf.destroy();
+    if (this.moverTrisBuf) this.moverTrisBuf.destroy();
+    this.moverNodesBuf = d.createBuffer({ size: packed.nodes.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(this.moverNodesBuf, 0, packed.nodes);
+    this.moverTrisBuf = d.createBuffer({ size: packed.tris.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(this.moverTrisBuf, 0, packed.tris);
+    if (this.sceneRes) this._rebuildBindGroups();
+  }
+
+  // Upload this frame's mover instances; returns the drawable list (index = firstInstance).
+  _writeMoverUniform() {
+    const buf = this._moverData;
+    const f = new Float32Array(buf), u32 = new Uint32Array(buf);
+    const active = [];
+    for (const o of this.dynObjects || []) {
+      if (active.length >= MAX_MOVERS) break;
+      const mesh = this.moverMeshes.get(o.mesh ?? this.SPHERE_MESH);
+      if (!mesh) continue;
+      const l2w = o.matrix ? Float32Array.from(o.matrix) : composeMat4(o.pos || [0, 0, 0], o.rotation || [0, 0, 0, 1], o.scale ?? o.radius ?? 1);
+      const w2l = invertMat4(l2w);
+      if (!w2l) continue;
+      const base = 4 + active.length * MOVER_STRIDE_FLOATS;
+      f.set(w2l, base);
+      f.set(l2w, base + 16);
+      const [cx, cy, cz] = mesh.center;
+      const sMax = Math.max(Math.hypot(l2w[0], l2w[1], l2w[2]), Math.hypot(l2w[4], l2w[5], l2w[6]), Math.hypot(l2w[8], l2w[9], l2w[10]));
+      f[base + 32] = l2w[0] * cx + l2w[4] * cy + l2w[8] * cz + l2w[12];
+      f[base + 33] = l2w[1] * cx + l2w[5] * cy + l2w[9] * cz + l2w[13];
+      f[base + 34] = l2w[2] * cx + l2w[6] * cy + l2w[10] * cz + l2w[14];
+      f[base + 35] = mesh.radius * sMax * 1.001 + 1e-4;
+      const col = o.color || (mesh.kind === MOVER_KIND_SPHERE ? [0.8, 0.8, 0.8] : [1, 1, 1]);
+      const hasRough = typeof o.roughness === 'number';
+      f.set([col[0], col[1], col[2], hasRough ? o.roughness : 0], base + 36);
+      f.set([mesh.qMin[0], mesh.qMin[1], mesh.qMin[2], 0], base + 40);
+      f.set([mesh.qScale[0], mesh.qScale[1], mesh.qScale[2], 0], base + 44);
+      u32.set([mesh.kind, mesh.root, mesh.single ? 1 : 0, hasRough ? 1 : 0], base + 48);
+      active.push({ mesh, index: active.length });
+    }
+    u32[0] = active.length;
+    this.activeMoverCount = active.length;
+    this.device.queue.writeBuffer(this.moverUBuf, 0, buf);
+    return active;
   }
 
   async bakeSDF(globalBvh, opts) {
@@ -2070,7 +2233,15 @@ export class WebGPUFastSDFAO {
   _rebuildBindGroups() {
     const d = this.device, s = this.sceneRes;
     this.gBG = d.createBindGroup({ layout: this.gPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.camUBuf } }] });
-    this.dynGBG = d.createBindGroup({ layout: this.dynGPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.camUBuf } }] });
+    this.moverGBG = d.createBindGroup({
+      layout: this.moverGPipe.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: this.camUBuf } }, { binding: 1, resource: { buffer: this.moverUBuf } }],
+    });
+    const moverEntries = (b0) => [
+      { binding: b0, resource: { buffer: this.moverUBuf } },
+      { binding: b0 + 1, resource: { buffer: this.moverNodesBuf } },
+      { binding: b0 + 2, resource: { buffer: this.moverTrisBuf } },
+    ];
     this.relightDirectBG = d.createBindGroup({
       layout: this.relightDirectPipe.getBindGroupLayout(0),
       entries: [
@@ -2119,6 +2290,7 @@ export class WebGPUFastSDFAO {
         { binding: 12, resource: { buffer: this.statsBuf } },
         { binding: 13, resource: this.gAlbedo.createView() },
         { binding: 14, resource: this.histMeta[1 - pIdx].createView() },
+        ...moverEntries(15),
       ],
     });
     this.traceBG1B = [makeTraceBG(this.radVolA.createView(), 0), makeTraceBG(this.radVolA.createView(), 1)];
@@ -2176,6 +2348,7 @@ export class WebGPUFastSDFAO {
         { binding: 10, resource: this.histAOGI[pIdx].createView() },
         { binding: 11, resource: this.histMeta[pIdx].createView() },
         { binding: 12, resource: this.rawRefl.createView() },
+        ...moverEntries(13),
       ],
     });
     this.reflTraceBG1B = [makeReflTraceBG(this.radVolA.createView(), 0), makeReflTraceBG(this.radVolA.createView(), 1)];
@@ -2213,14 +2386,16 @@ export class WebGPUFastSDFAO {
         { binding: 7, resource: this.radVolB.createView() },
         { binding: 8, resource: this.gAlbedo.createView() },
         { binding: 9, resource: this.linSamp },
+        ...moverEntries(10),
       ],
     });
     this.compBGHist = [makeCompBG(this.compPipe, this.histAOGI[0], 0), makeCompBG(this.compPipe, this.histAOGI[1], 1)];
     this.compBGD1   = [makeCompBG(this.compPipe, this.denoiseA, 0), makeCompBG(this.compPipe, this.denoiseA, 1)];
     this.compBGD2   = [makeCompBG(this.compPipe, this.denoiseB, 0), makeCompBG(this.compPipe, this.denoiseB, 1)];
-    this.dynCompBGHist = [makeCompBG(this.dynCompPipe, this.histAOGI[0], 0), makeCompBG(this.dynCompPipe, this.histAOGI[1], 1)];
-    this.dynCompBGD1   = [makeCompBG(this.dynCompPipe, this.denoiseA, 0), makeCompBG(this.dynCompPipe, this.denoiseA, 1)];
-    this.dynCompBGD2   = [makeCompBG(this.dynCompPipe, this.denoiseB, 0), makeCompBG(this.dynCompPipe, this.denoiseB, 1)];
+    this.moverCompBGHist = [makeCompBG(this.moverCompPipe, this.histAOGI[0], 0), makeCompBG(this.moverCompPipe, this.histAOGI[1], 1)];
+    this.moverCompBGD1   = [makeCompBG(this.moverCompPipe, this.denoiseA, 0), makeCompBG(this.moverCompPipe, this.denoiseA, 1)];
+    this.moverCompBGD2   = [makeCompBG(this.moverCompPipe, this.denoiseB, 0), makeCompBG(this.moverCompPipe, this.denoiseB, 1)];
+    this._lastCompBG = null;
   }
 
   clearHash() {
@@ -2295,15 +2470,8 @@ export class WebGPUFastSDFAO {
         if (Math.abs(vp[i] - this.prevVP[i]) > 1e-5) { camSame = false; break; }
       }
     }
-    const hasDyn = this.dynObjects && this.dynObjects.length > 0;
-    const dynCount = hasDyn ? Math.min(this.dynObjects.length, 4) : 0;
-    const dynPR = new Float32Array(16);
-    const dynCR = new Float32Array(16);
-    for (let i = 0; i < dynCount; i++) {
-      const o = this.dynObjects[i];
-      dynPR.set([o.pos[0], o.pos[1], o.pos[2], o.radius], i * 4);
-      dynCR.set([o.color[0], o.color[1], o.color[2], o.roughness], i * 4);
-    }
+    const movers = this._writeMoverUniform();
+    const hasDyn = movers.length > 0;
 
     const hasOrb = (this.emissiveCol[0] + this.emissiveCol[1] + this.emissiveCol[2]) > 1e-3;
     this.stillFrames = (camSame && !hasDyn && !hasOrb) ? (this.stillFrames + 1) : 0;
@@ -2313,11 +2481,10 @@ export class WebGPUFastSDFAO {
     const effGiSteps = (!camSame) ? Math.min(q.giSteps, 10) : q.giSteps;
     const effDenoisePasses = (!camSame || hasDyn) ? Math.min(q.denoisePasses, 2) : q.denoisePasses;
 
-    const camData = new Float32Array(64);
+    const camData = new Float32Array(36);
     camData.set(vp, 0);
     camData.set(view, 16);
-    camData.set(dynPR, 32);
-    camData.set(dynCR, 48);
+    camData.set([eye[0], eye[1], eye[2], 1], 32);
     d.queue.writeBuffer(this.camUBuf, 0, camData);
 
     const tBuf = new ArrayBuffer(384);
@@ -2332,12 +2499,10 @@ export class WebGPUFastSDFAO {
     tf.set([this.emissiveCol[0], this.emissiveCol[1], this.emissiveCol[2], q.giMaxDist], 40);
     tf.set([this.aoW, this.aoH, this.frame, 0.0005], 44);
     tu.set([q.rays, q.maxSamples, this.useGI ? 1 : 0, (this.useHash && !hasDyn && !hasOrb) ? 1 : 0], 48);
-    const extraFlags = (this.reuseEnabled ? 1 : 0) | (traceShadows ? 2 : 0) | (q.multiBounce ? 4 : 0) | (hasDyn ? 8 : 0) | ((effGiSteps & 0xFF) << 8);
+    const extraFlags = (this.reuseEnabled ? 1 : 0) | (traceShadows ? 2 : 0) | (q.multiBounce ? 4 : 0) | ((effGiSteps & 0xFF) << 8);
     tu.set([effShadowSteps, HASH_MASK, extraFlags, s.nodeCount], 52);
     tf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 56);
     tf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 60);
-    tf.set(dynPR, 64);
-    tf.set(dynCR, 80);
     d.queue.writeBuffer(this.traceUBuf, 0, tBuf);
 
     const rBuf = new ArrayBuffer(384);
@@ -2354,10 +2519,8 @@ export class WebGPUFastSDFAO {
     rf.set([this.aoW, this.aoH, q.reflRoughCut, 10.0], 48);
     rf.set([s.rootMin[0], s.rootMin[1], s.rootMin[2], 0], 52);
     rf.set([s.rootSpan[0], s.rootSpan[1], s.rootSpan[2], 0], 56);
-    const reflFlags = (q.reflChecker ? 1 : 0) | (q.reflUseBvh ? 2 : 0) | (hasDyn ? 4 : 0);
+    const reflFlags = (q.reflChecker ? 1 : 0) | (q.reflUseBvh ? 2 : 0);
     ru.set([s.nodeCount, (this.useGI && this.useReflections) ? 1 : 0, reflFlags, q.reflSteps], 60);
-    rf.set(dynPR, 64);
-    rf.set(dynCR, 80);
     d.queue.writeBuffer(this.reflUBuf, 0, rBuf);
 
     const rfData = new Float32Array(24);
@@ -2379,7 +2542,7 @@ export class WebGPUFastSDFAO {
     d.queue.writeBuffer(this.denoiseUBuf2, 0, new Uint32Array([this.aoW, this.aoH, 2, 0]));
     d.queue.writeBuffer(this.denoiseUBuf3, 0, new Uint32Array([this.aoW, this.aoH, 4, 0]));
 
-    const cBuf = new Float32Array(76);
+    const cBuf = new Float32Array(44);
     cBuf.set(vp, 0);
     cBuf.set([eye[0], eye[1], eye[2], this.frame], 16);
     cBuf.set([this.sunDir[0], this.sunDir[1], this.sunDir[2], this.useGI ? 1 : 0], 20);
@@ -2388,8 +2551,6 @@ export class WebGPUFastSDFAO {
     cBuf.set([this.width, this.height, this.aoW, this.aoH], 32);
     cBuf.set([s.sdfMin[0], s.sdfMin[1], s.sdfMin[2], RAD_SCALE], 36);
     cBuf.set([1 / s.sdfSpan[0], 1 / s.sdfSpan[1], 1 / s.sdfSpan[2], (this.useGI && this.useReflections) ? 1 : 0], 40);
-    cBuf.set(dynPR, 44);
-    cBuf.set(dynCR, 60);
     d.queue.writeBuffer(this.compUBuf, 0, cBuf);
 
     // Fully-settled static fast-path: skip G-buffer + trace + temporal + denoise completely when
@@ -2463,12 +2624,14 @@ export class WebGPUFastSDFAO {
     gp.setVertexBuffer(0, s.vb);
     gp.setIndexBuffer(s.ib, 'uint32');
     gp.drawIndexed(s.indexCount);
-    if (dynCount > 0) {
-      gp.setPipeline(this.dynGPipe);
-      gp.setBindGroup(0, this.dynGBG);
-      gp.setVertexBuffer(0, this.orbVB);
-      gp.setIndexBuffer(this.orbIB, 'uint32');
-      gp.drawIndexed(this.orbIdxCount, dynCount);
+    if (hasDyn) {
+      gp.setPipeline(this.moverGPipe);
+      gp.setBindGroup(0, this.moverGBG);
+      for (const { mesh, index } of movers) {
+        gp.setVertexBuffer(0, mesh.vb);
+        gp.setIndexBuffer(mesh.ib, 'uint32');
+        gp.drawIndexed(mesh.indexCount, 1, 0, 0, index);
+      }
     }
     gp.end();
 
@@ -2492,24 +2655,24 @@ export class WebGPUFastSDFAO {
     }
 
     let compBG = this.compBGHist[curIdx];
-    let dynCompBG = this.dynCompBGHist[curIdx];
+    let moverCompBG = this.moverCompBGHist[curIdx];
     if (this.useGI) {
       cp.setPipeline(this.denoisePipe);
       cp.setBindGroup(0, this.denoiseBG1[curIdx]);
       cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
       compBG = this.compBGD1[curIdx];
-      dynCompBG = this.dynCompBGD1[curIdx];
+      moverCompBG = this.moverCompBGD1[curIdx];
       if (effDenoisePasses >= 2) {
         cp.setBindGroup(0, this.denoiseBG2[curIdx]);
         cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
         compBG = this.compBGD2[curIdx];
-        dynCompBG = this.dynCompBGD2[curIdx];
+        moverCompBG = this.moverCompBGD2[curIdx];
       }
       if (effDenoisePasses >= 3) {
         cp.setBindGroup(0, this.denoiseBG3[curIdx]);
         cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
         compBG = this.compBGD1[curIdx];
-        dynCompBG = this.dynCompBGD1[curIdx];
+        moverCompBG = this.moverCompBGD1[curIdx];
       }
     } else {
       // Single stride-1 plane-aware AO polish dissolves SHaRC cell jitter while preserving sharp contacts
@@ -2517,7 +2680,7 @@ export class WebGPUFastSDFAO {
       cp.setBindGroup(0, this.denoiseBG1[curIdx]);
       cp.dispatchWorkgroups(Math.ceil(this.aoW / 8), Math.ceil(this.aoH / 8));
       compBG = this.compBGD1[curIdx];
-      dynCompBG = this.dynCompBGD1[curIdx];
+      moverCompBG = this.moverCompBGD1[curIdx];
     }
     cp.end();
 
@@ -2538,12 +2701,14 @@ export class WebGPUFastSDFAO {
     fp.setVertexBuffer(0, s.vb);
     fp.setIndexBuffer(s.ib, 'uint32');
     fp.drawIndexed(s.indexCount);
-    if (dynCount > 0) {
-      fp.setPipeline(this.dynCompPipe);
-      fp.setBindGroup(0, dynCompBG);
-      fp.setVertexBuffer(0, this.orbVB);
-      fp.setIndexBuffer(this.orbIB, 'uint32');
-      fp.drawIndexed(this.orbIdxCount, dynCount);
+    if (hasDyn) {
+      fp.setPipeline(this.moverCompPipe);
+      fp.setBindGroup(0, moverCompBG);
+      for (const { mesh, index } of movers) {
+        fp.setVertexBuffer(0, mesh.vb);
+        fp.setIndexBuffer(mesh.ib, 'uint32');
+        fp.drawIndexed(mesh.indexCount, 1, 0, 0, index);
+      }
     }
     if (this.viewMode === 0 && (this.emissiveCol[0] + this.emissiveCol[1] + this.emissiveCol[2]) > 1e-3) {
       const oBuf = new Float32Array(24);
