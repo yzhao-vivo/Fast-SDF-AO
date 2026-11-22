@@ -63,6 +63,25 @@ for mode, g in G.items():
 # How large the movers' effect is on those pixels (what ignoring the movers entirely would cost)
 metrics['ignore_movers'] = {q: float(absdiff(S[q], R[q])[masks[q]].mean()) for q in ('ao', 'gi', 'sun')}
 
+# Mover-effect error: (GPU with movers - GPU without) vs (reference with - reference without), on
+# mover-affected pixels whose surface is the same in both captures (not covered by a mover). The
+# renderer's static-scene bias (sky term, multi-bounce volume, SDF approximations) cancels out.
+if (out / 'gpu_none_aogi.f32').exists():
+    N = gpu('none')
+    pos = {m: np.fromfile(out / f'gpu_{m}_pos.f32', np.float32).reshape(-1, 4)[valid] for m in ('bvh', 'none')}
+    same = np.linalg.norm(pos['bvh'][:, :3] - pos['none'][:, :3], axis=1) < 0.01
+    metrics['effect'] = {'pixels': {q: int((masks[q] & same).sum()) for q in masks}, 'modes': {}}
+    for mode, g in G.items():
+        em = {}
+        for q in ('ao', 'gi', 'sun'):
+            m = masks[q] & same
+            d_gpu, d_ref = g[q] - N[q], R[q] - S[q]
+            err = absdiff(d_gpu, d_ref)
+            mag = np.abs(d_ref).mean(1) if d_ref.ndim == 2 else np.abs(d_ref)
+            em[q] = {'mae': float(err[m].mean()), 'ref_effect': float(mag[m].mean()),
+                     'captured': float(1 - err[m].mean() / max(mag[m].mean(), 1e-9))}
+        metrics['effect']['modes'][mode] = em
+
 
 # ---------------- images ----------------
 def to_img(vals, kind):
@@ -131,6 +150,16 @@ for q, name in (('ao', 'AO'), ('sun', 'Sun visibility'), ('gi', 'GI bounce (line
     lines.append(f"| {name}, mover-affected bias (GPU − ref) | {f(mB[q]['bias_affected'])} | {f(mS[q]['bias_affected'])} | |")
     lines.append(f"| {name}, all pixels | {f(mB[q]['mae_all'])} | {f(mS[q]['mae_all'])} | |")
 lines += ['', '"Ignoring movers" is the reference without movers scored against the reference with them: the size of the effect a method has to capture.', '']
+if 'effect' in metrics:
+    eB, eS = metrics['effect']['modes']['bvh'], metrics['effect']['modes']['sdf']
+    lines += ['### Mover effect only (static-scene bias removed)', '',
+              'Error of (GPU with movers − GPU without movers) against (reference with − reference without), on mover-affected pixels '
+              'not covered by a mover. "Captured" = 1 − error / reference effect.', '',
+              '| Metric | Reference effect | Exact BVH error | Baked SDF error | Exact BVH captured | Baked SDF captured |', '|---|---:|---:|---:|---:|---:|']
+    for q, name in (('ao', 'AO'), ('sun', 'Sun visibility'), ('gi', 'GI bounce (linear RGB)')):
+        lines.append(f"| {name} ({metrics['effect']['pixels'][q]:,} px) | {f(eB[q]['ref_effect'])} | **{f(eB[q]['mae'])}** | {f(eS[q]['mae'])} | "
+                     f"{eB[q]['captured'] * 100:.0f}% | {eS[q]['captured'] * 100:.0f}% |")
+    lines.append('')
 perf = run['perf']
 lines += ['## Cost (median per frame, movers animating)', '', perf['markdown'], '']
 lines += ['## Build cost', '', '| Mesh | Triangles | Exact BVH: CPU build (ms) | BVH memory (MiB) | Baked SDF: GPU bake (ms) |', '|---|---:|---:|---:|---:|']

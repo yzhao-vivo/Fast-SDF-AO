@@ -252,7 +252,23 @@ async function main() {
     }
   }
 
-  // ---- Reference: exact world-space triangles (static Atrium + posed movers) ----
+  // Same pose without movers (and, like the mover runs, without the SHaRC cache): subtracting it isolates
+  // each method's mover effect from the renderer's own static-scene bias.
+  console.log(`Converging without movers (${FRAMES} frames)…`);
+  const none = await page.evaluate(async ({ frames, stride, t }) => {
+    const D = window.wgpuDemo, g = D.gpu, hash = g.useHash;
+    D.setMovers(false, t);
+    g.useHash = false;
+    g.clearHash();
+    for (let i = 0; i < frames; i++) { D.renderOnce(); await g.device.queue.onSubmittedWorkDone(); }
+    const cap = await window.__bench.capture(stride);
+    g.useHash = hash;
+    D.setMovers(true, t);
+    return cap;
+  }, { frames: FRAMES, stride: STRIDE, t: POSE_T });
+  for (const [k, v] of Object.entries(none)) fs.writeFileSync(path.join(OUT, `gpu_none_${k}.f32`), Buffer.from(v.data, 'base64'));
+
+  // ---- Reference: exact world-space triangles (static scene + posed movers) ----
   console.log('Exporting triangles…');
   const moverTris = Buffer.from(await page.evaluate(() => window.__bench.moverTriangles()), 'base64');
   const staticTris = Buffer.from(await page.evaluate(() => window.__bench.staticTriangles()), 'base64');
