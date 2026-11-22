@@ -30,7 +30,10 @@ gpu.dynObjects = [
 ];
 gpu.render(eye, target);
 // gpu.removeMoverMesh(teapot) frees it; objects that still reference it are skipped.
+gpu.setMoverTracing('sdf'); // compare with the original method; 'bvh' (default) is exact tracing
 ```
+
+**Mover rays: Exact BVH vs Baked SDF (original).** `webgpu.html` has a two-button switch for how secondary rays see moving objects. *Exact BVH* (default) intersects each mover's triangles as described above. *Baked SDF (original)* reproduces the SDF method the backend started with: every registered mesh is also baked on the GPU into a `64³` FP16 local SDF (one slab of a shared atlas), and in this mode movers are `min()`'d into the scene distance at their current transform, so AO, GI, soft shadows and reflections sphere-trace them like static geometry and shade hits with the SDF gradient normal (the analytic sphere keeps its exact distance, as before). Only the secondary rays change; both modes rasterize the same mesh.
 
 Movers are rigid (no skinning or deformation). They are excluded from the SHaRC hash and the radiance volume, so while any mover is present the hash is bypassed and the volume does not see them: off-screen mover hits are shaded with unshadowed sun + sky, and movers do not occlude light inside the volume's own 2-bounce gather.
 

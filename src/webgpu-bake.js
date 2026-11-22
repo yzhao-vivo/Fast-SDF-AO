@@ -237,7 +237,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 const pipelineCache = new WeakMap();
 
-export async function bakeSDFOnGPU(device, globalBvh, { sdfMin, sdfSpan, sdfDims, clip = 1.5 }) {
+// outTexture/outOrigin bake into a region of an existing r16float 3D texture (e.g. one slab of the
+// moving-object SDF atlas) instead of allocating a new texture. All GPU work is submitted before the
+// first await, so callers may skip awaiting: later submissions on the queue see the finished bake.
+export async function bakeSDFOnGPU(device, globalBvh, { sdfMin, sdfSpan, sdfDims, clip = 1.5, outTexture = null, outOrigin = [0, 0, 0] }) {
   const t0 = performance.now();
   let pipe = pipelineCache.get(device);
   if (!pipe) {
@@ -286,7 +289,7 @@ export async function bakeSDFOnGPU(device, globalBvh, { sdfMin, sdfSpan, sdfDims
     ],
   });
 
-  const sdfTex = device.createTexture({
+  const sdfTex = outTexture || device.createTexture({
     size: [nx, ny, nz],
     dimension: '3d',
     format: 'r16float',
@@ -299,7 +302,7 @@ export async function bakeSDFOnGPU(device, globalBvh, { sdfMin, sdfSpan, sdfDims
   pass.setBindGroup(0, bg);
   pass.dispatchWorkgroups(Math.ceil(Math.ceil(nx / 2) / 4), Math.ceil(ny / 4), Math.ceil(nz / 4));
   pass.end();
-  enc.copyBufferToTexture({ buffer: outBuf, bytesPerRow, rowsPerImage: ny }, { texture: sdfTex }, [nx, ny, nz]);
+  enc.copyBufferToTexture({ buffer: outBuf, bytesPerRow, rowsPerImage: ny }, { texture: sdfTex, origin: outOrigin }, [nx, ny, nz]);
   device.queue.submit([enc.finish()]);
   await device.queue.onSubmittedWorkDone();
 

@@ -58,6 +58,10 @@ canvas{display:block;width:100%;height:auto}
     <label><input id="emissive" type="checkbox"> Emissive Orb</label>
     <label><input id="movers" type="checkbox"> Moving Objects</label>
     <label title="Dropped .glb/.obj files become an orbiting, ray-traced moving object instead of replacing the scene"><input id="drop-mover" type="checkbox"> Drop as mover</label>
+    <span role="group" aria-label="How rays see moving objects" style="display:flex;align-items:center;gap:6px">Mover rays:
+      <button data-mover-mode="bvh" aria-pressed="true" title="Exact ray/triangle tracing through each mesh's local BVH">Exact BVH</button>
+      <button data-mover-mode="sdf" aria-pressed="false" title="Original method: each mesh baked into a 64³ local SDF, min()'d into the scene distance">Baked SDF (original)</button>
+    </span>
     <label>Sun <input id="sun" type="range" min="-65" max="65" value="22" step="1" style="width:90px"><span id="sun-val" style="min-width:32px">22°</span></label>
     <button id="clear">Clear Cache</button>
   </nav>
@@ -301,6 +305,16 @@ try {
     moversOn = e.target.checked;
     updateMovers(simTime);
   };
+  // Switch how secondary rays (GI, AO, shadows, reflections) see moving objects
+  const moverModeBtns = document.querySelectorAll('button[data-mover-mode]');
+  function setMoverTracing(mode) {
+    gpu.setMoverTracing(mode);
+    moverModeBtns.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.moverMode === mode)));
+    statusEl.value = mode === 'sdf'
+      ? 'Mover rays: Baked SDF (original method), each mesh baked into a 64³ local SDF and min()\'d into the scene distance'
+      : 'Mover rays: Exact BVH, rays transformed into each mover\'s local space and intersected with its triangles';
+  }
+  moverModeBtns.forEach(b => { b.onclick = () => setMoverTracing(b.dataset.moverMode); });
   document.querySelector('#sun').oninput = e => {
     sunDeg = Number(e.target.value);
     document.querySelector('#sun-val').textContent = `${sunDeg}°`;
@@ -510,6 +524,7 @@ try {
     loadCustomThreeObject,
     loadCustomMoverOBJ: async (objText, name = 'mover.obj') => loadCustomMover(new OBJLoader().parse(objText), name),
     moverMeshes: { teapot: teapotMesh, knot: knotMesh },
+    setMoverTracing,
     setMovers: (on, t = 0.6) => {
       moversOn = !!on;
       document.querySelector('#movers').checked = moversOn;

@@ -37,7 +37,7 @@ struct ReflU {
 @group(0) @binding(11) var metaTex: texture_2d<f32>;
 @group(0) @binding(12) var outRefl: texture_storage_2d<rgba16float, write>;
 ${moverUniformWGSL(13)}
-${moverTraceWGSL(14, 15)}
+${moverTraceWGSL(14, 15, 16)}
 
 fn ign(q: vec2<f32>) -> f32 {
   return fract(52.9829189 * fract(dot(q, vec2<f32>(0.06711056, 0.00583715))));
@@ -65,13 +65,19 @@ fn vdc3(n_in: u32) -> f32 {
   return r;
 }
 
-// Static scene SDF only: moving objects are traced exactly through traceMovers().
-fn sampleSDF(p: vec3<f32>) -> f32 {
+fn sampleStaticSDF(p: vec3<f32>) -> f32 {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
   if (all(uv >= vec3<f32>(0.0)) && all(uv <= vec3<f32>(1.0))) {
     return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
   }
   return 1e4;
+}
+
+// Static scene; in baked-SDF mover mode (original method) the movers' baked SDFs are min()'d in.
+fn sampleSDF(p: vec3<f32>) -> f32 {
+  let d = sampleStaticSDF(p);
+  if (mvSdfMode()) { return min(d, mvSdfClosest(p, d).x); }
+  return d;
 }
 
 fn sampleRad(p: vec3<f32>) -> vec3<f32> {
@@ -118,8 +124,16 @@ fn screenHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec4<f32> {
   return vec4<f32>(0.0);
 }
 
-// Static-scene hit: G-buffer when visible, else the 360-degree 2-bounce radVol.
+// SDF/static hit: G-buffer when visible, else the 360-degree 2-bounce radVol. In baked-SDF mover
+// mode the march may have landed on a mover: shade it with its SDF-gradient normal.
 fn evalHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  if (mvSdfMode()) {
+    let mi = mvSdfHitIndex(hitP, sampleStaticSDF(hitP), 0.06);
+    if (mi >= 0) {
+      let i = u32(mi);
+      return evalMoverHitRadiance(hitP, mvSdfNormal(i, hitP, rayDir), mv.m[i].sdfAlb.rgb, rayDir);
+    }
+  }
   let s = screenHitRadiance(hitP, rayDir);
   if (s.a > 0.5) { return s.rgb; }
   return sampleRad(hitP);

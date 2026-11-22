@@ -10,7 +10,7 @@
 import { bakeSDFOnGPU } from './webgpu-bake.js';
 import { REFL_TRACE_WGSL, REFL_FILTER_WGSL } from './webgpu-refl.js';
 import {
-  MAX_MOVERS, MOVER_STRIDE_FLOATS, MOVER_UBO_BYTES, MOVER_KIND_BVH, MOVER_KIND_SPHERE,
+  MAX_MOVERS, MOVER_STRIDE_FLOATS, MOVER_UBO_BYTES, MOVER_KIND_BVH, MOVER_KIND_SPHERE, MOVER_SDF_RES, MOVER_SDF_SLABS,
   moverUniformWGSL, moverTraceWGSL, buildMoverBLAS, packMoverBLAS, computeVertexNormals, composeMat4, invertMat4,
 } from './webgpu-movers.js';
 
@@ -385,7 +385,7 @@ struct HitRec {
 @group(0) @binding(13) var gAlbedoRough: texture_2d<f32>;
 @group(0) @binding(14) var prevHistMeta: texture_2d<f32>;
 ${moverUniformWGSL(15)}
-${moverTraceWGSL(16, 17)}
+${moverTraceWGSL(16, 17, 18)}
 
 // Self-intersection guard for exact mover hits (rays leave their own surface with a 0.5 mm bias).
 const MV_TMIN: f32 = 0.002;
@@ -434,13 +434,20 @@ fn hashCell(cx: i32, cy: i32, cz: i32, nCode: u32, lod: u32) -> vec2<u32> {
   return vec2<u32>(h1, h2);
 }
 
-// Static scene SDF only: moving objects are traced exactly through traceMovers()/moversOccluded().
-fn sampleSDF(p: vec3<f32>) -> f32 {
+fn sampleStaticSDF(p: vec3<f32>) -> f32 {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
   if (all(uv >= vec3<f32>(0.0)) && all(uv <= vec3<f32>(1.0))) {
     return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
   }
   return 1e4;
+}
+
+// Scene distance. Exact-BVH mover mode: static only (movers are traced by traceMovers()/moversOccluded()).
+// Baked-SDF mover mode (original method): movers' baked SDFs are min()'d in, so every march sees them.
+fn sampleSDF(p: vec3<f32>) -> f32 {
+  let d = sampleStaticSDF(p);
+  if (mvSdfMode()) { return min(d, mvSdfClosest(p, d).x); }
+  return d;
 }
 
 fn sampleRad(p: vec3<f32>) -> vec3<f32> {
@@ -483,9 +490,17 @@ fn screenHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec4<f32> {
   return vec4<f32>(max(rad, vec3<f32>(0.0)), 1.0);
 }
 
-// Hybrid Screen-Space + World radVol Diffuse GI Hit Evaluation for static-scene hits: G-buffer
+// Hybrid Screen-Space + World radVol Diffuse GI Hit Evaluation for SDF/static hits: G-buffer
 // shading when visible (zero 11cm voxel light leak), else the 360-deg world-space radVol.
+// In baked-SDF mover mode a march may have landed on a mover: shade it with its SDF-gradient normal.
 fn evalGIHitRadiance(hitP: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  if (mvSdfMode()) {
+    let mi = mvSdfHitIndex(hitP, sampleStaticSDF(hitP), 0.07);
+    if (mi >= 0) {
+      let i = u32(mi);
+      return evalMoverHitRadiance(hitP, mvSdfNormal(i, hitP, rayDir), mv.m[i].sdfAlb.rgb, rayDir);
+    }
+  }
   let s = screenHitRadiance(hitP, rayDir);
   if (s.a > 0.5) {
     // When multi-bounce is enabled, blend in 2nd-bounce energy from radVolB
@@ -1295,7 +1310,7 @@ struct CompU {
 @group(0) @binding(8) var gAlbedoRough: texture_2d<f32>;
 @group(0) @binding(9) var linSamp: sampler;
 ${moverUniformWGSL(10)}
-${moverTraceWGSL(11, 12)}
+${moverTraceWGSL(11, 12, 13)}
 
 struct VIn {
   @location(0) pos: vec3<f32>,
@@ -1348,12 +1363,19 @@ fn ignComp(q: vec2<f32>) -> f32 {
   return fract(52.9829189 * fract(dot(q, vec2<f32>(0.06711056, 0.00583715))));
 }
 
-fn compSampleSDF(p: vec3<f32>) -> f32 {
+fn compSampleStaticSDF(p: vec3<f32>) -> f32 {
   let uv = (p - u.sdfMin.xyz) * u.sdfInvSpan.xyz;
   if (all(uv >= vec3<f32>(0.0)) && all(uv <= vec3<f32>(1.0))) {
     return textureSampleLevel(sdfTex, linSamp, uv, 0.0).r;
   }
   return 1e4;
+}
+
+// Static scene, plus the movers' baked SDFs in baked-SDF mover mode (original method).
+fn compSampleSDF(p: vec3<f32>) -> f32 {
+  let d = compSampleStaticSDF(p);
+  if (mvSdfMode()) { return min(d, mvSdfClosest(p, d).x); }
+  return d;
 }
 
 // Shade a reflection hit from the half-res G-buffer (.a = 1) when it is on screen and faces the ray.
@@ -1393,6 +1415,16 @@ fn compSampleRad(p: vec3<f32>) -> vec3<f32> {
   return textureSampleLevel(radVol, linSamp, uv, 0.0).rgb * u.sdfMin.w;
 }
 
+// Mirror-reflected moving object: G-buffer shading when on screen, else sun + sky on the hit normal.
+fn compMoverRad(hitP: vec3<f32>, n: vec3<f32>, alb: vec3<f32>, R: vec3<f32>) -> vec3<f32> {
+  let sc = compScreenRad(hitP, R);
+  if (sc.a > 0.5) { return sc.rgb; }
+  let sDir = normalize(u.sunDir.xyz);
+  let sun = max(0.0, dot(n, sDir));
+  let skyT = clamp(n.z * 0.5 + 0.5, 0.0, 1.0);
+  return alb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
+}
+
 // Full-resolution 1280x720 exact mirror chrome trace (runs ONLY on mirror pixels: <1.5% of screen!)
 // Zero half-res stair-stepping, zero temporal smear, pixel-sharp G-buffer + 360-deg radVol fallback.
 fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
@@ -1425,17 +1457,9 @@ fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
     s += max(d * 0.85, 0.025);
     if (s > 10.5) { break; }
   }
-  // Exact moving-object hit in front of the static hit / orb
+  // Exact moving-object hit in front of the static hit / orb (exact-BVH mover mode)
   let mh = traceMovers(ro, R, 0.002, min(hitDist, orbT));
-  if (mh.t > 0.0) {
-    let mp = ro + R * mh.t;
-    let sc = compScreenRad(mp, R);
-    if (sc.a > 0.5) { return sc.rgb; }
-    let sDir = normalize(u.sunDir.xyz);
-    let sun = max(0.0, dot(mh.n, sDir));
-    let skyT = clamp(mh.n.z * 0.5 + 0.5, 0.0, 1.0);
-    return mh.alb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
-  }
+  if (mh.t > 0.0) { return compMoverRad(ro + R * mh.t, mh.n, mh.alb, R); }
   if (orbT < hitDist) { return u.emissiveCol.rgb * 1.9; }
   if (!hitAny) {
     let skyT = clamp(R.z * 0.5 + 0.5, 0.0, 1.0);
@@ -1447,6 +1471,9 @@ fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
     return mix(vec3<f32>(0.22, 0.24, 0.28), vec3<f32>(0.62, 0.72, 0.88), skyT) + sunDisc + keyBox + rimBox + softBox;
   }
   let hitP = ro + R * hitDist;
+  // Baked-SDF mover mode: the march itself may have landed on a mover
+  let mi = mvSdfHitIndex(hitP, compSampleStaticSDF(hitP), 0.05);
+  if (mi >= 0) { return compMoverRad(hitP, mvSdfNormal(u32(mi), hitP, R), mv.m[u32(mi)].sdfAlb.rgb, R); }
   let sc = compScreenRad(hitP, R);
   if (sc.a > 0.5) { return sc.rgb; }
   return compSampleRad(hitP);
@@ -1987,6 +2014,17 @@ export class WebGPUFastSDFAO {
     this.moverNodesBuf = null;
     this.moverTrisBuf = null;
     this.activeMoverCount = 0;
+    // How secondary rays see moving objects: 'bvh' = exact triangle tracing (default),
+    // 'sdf' = baked local SDF min()'d into the scene distance (the original SDF method, for comparison).
+    this.moverTracing = 'bvh';
+    // Shared atlas of per-mesh baked SDFs: MOVER_SDF_SLABS slabs of MOVER_SDF_RES^3, stacked along Z.
+    this.moverSdfAtlas = this.device.createTexture({
+      size: [MOVER_SDF_RES, MOVER_SDF_RES, MOVER_SDF_RES * MOVER_SDF_SLABS],
+      dimension: '3d', format: 'r16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.moverSdfAtlasView = this.moverSdfAtlas.createView();
+    this._freeSdfSlabs = Array.from({ length: MOVER_SDF_SLABS }, (_, i) => i);
     // Built-in mesh 0: analytic unit sphere (exact ray/sphere test, tessellated only for raster).
     const sph = makeUnitSphereMesh(48, 28);
     this.SPHERE_MESH = this._registerMoverMesh({
@@ -2008,14 +2046,17 @@ export class WebGPUFastSDFAO {
     const idx = indices ? (indices instanceof Uint32Array ? indices : Uint32Array.from(indices)) : null;
     const nor = normals || computeVertexNormals(positions, idx);
     let triColors = null;
+    const meanAlbedo = [1, 1, 1];
     if (colors) {
       const triCount = idx ? idx.length / 3 : vCount / 3;
       triColors = new Float32Array(triCount * 3);
+      meanAlbedo.fill(0);
       for (let t = 0; t < triCount; t++) {
         for (let v = 0; v < 3; v++) {
           const vi = idx ? idx[t * 3 + v] : t * 3 + v;
           for (let k = 0; k < 3; k++) triColors[t * 3 + k] += colors[vi * 3 + k] / 3;
         }
+        for (let k = 0; k < 3; k++) meanAlbedo[k] += triColors[t * 3 + k] / triCount;
       }
     }
     const blas = buildMoverBLAS(positions, idx, triColors);
@@ -2034,10 +2075,50 @@ export class WebGPUFastSDFAO {
     }
     const id = this._registerMoverMesh({
       kind: MOVER_KIND_BVH, positions, normals: nor, indices: idx, colors, roughness,
-      center, radius: Math.sqrt(r2), blas,
+      center, radius: Math.sqrt(r2), blas, meanAlbedo,
     });
     this._packMovers();
+    this._bakeMoverSDF(this.moverMeshes.get(id), lo, hi);
     return id;
+  }
+
+  // Bake the mesh into one slab of the mover SDF atlas (for the 'sdf' comparison mode) with the
+  // in-browser GPU baker. The work is submitted immediately, so renders queued later see the result.
+  _bakeMoverSDF(mesh, lo, hi) {
+    const slab = this._freeSdfSlabs.shift();
+    if (slab === undefined) {
+      console.warn(`Mover SDF atlas is full (${MOVER_SDF_SLABS} meshes): mesh ${mesh.id} is invisible to rays in 'sdf' mode`);
+      return;
+    }
+    const maxDim = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 1e-3);
+    const size = maxDim * 1.16 + 0.04; // cube box with ~8% + 2 cm padding on every side
+    const sdfMin = [0, 1, 2].map(k => 0.5 * (lo[k] + hi[k]) - 0.5 * size);
+    const b = mesh.blas;
+    const bvh = {
+      nodes: b.nodeCount,
+      uniforms: {
+        contactNodes: { value: { image: { data: b.nodes } } },
+        contactTriangles: { value: { image: { data: b.tris } } },
+        contactRootMin: { value: { x: b.qMin[0], y: b.qMin[1], z: b.qMin[2] } },
+        contactRootSpan: { value: { x: b.span[0], y: b.span[1], z: b.span[2] } },
+      },
+    };
+    mesh.sdfSlab = slab;
+    mesh.sdfMin = sdfMin;
+    mesh.sdfInvSpan = 1 / size;
+    bakeSDFOnGPU(this.device, bvh, {
+      sdfMin, sdfSpan: [size, size, size], sdfDims: [MOVER_SDF_RES, MOVER_SDF_RES, MOVER_SDF_RES], clip: size,
+      outTexture: this.moverSdfAtlas, outOrigin: [0, 0, slab * MOVER_SDF_RES],
+    }).then(r => { mesh.sdfBakeMs = r.bakeMs; }).catch(e => console.error('Mover SDF bake failed:', e));
+  }
+
+  /** 'bvh' (exact triangle tracing) or 'sdf' (baked local SDFs, the original method). */
+  setMoverTracing(mode) {
+    if (mode !== 'bvh' && mode !== 'sdf') throw Error(`Unknown mover tracing mode: ${mode}`);
+    if (mode === this.moverTracing) return;
+    this.moverTracing = mode;
+    this.hasPrev = false; // restart temporal history so the comparison is not blended across modes
+    this.stillFrames = 0;
   }
 
   removeMoverMesh(id) {
@@ -2045,11 +2126,12 @@ export class WebGPUFastSDFAO {
     if (!mesh || id === this.SPHERE_MESH) return;
     mesh.vb.destroy();
     mesh.ib.destroy();
+    if (mesh.sdfSlab >= 0) this._freeSdfSlabs.push(mesh.sdfSlab);
     this.moverMeshes.delete(id);
     this._packMovers();
   }
 
-  _registerMoverMesh({ kind, positions, normals, indices, colors = null, roughness = null, center, radius, blas }) {
+  _registerMoverMesh({ kind, positions, normals, indices, colors = null, roughness = null, center, radius, blas, meanAlbedo = [1, 1, 1] }) {
     const d = this.device;
     const vCount = positions.length / 3;
     const inter = new Float32Array(vCount * 10);
@@ -2071,6 +2153,7 @@ export class WebGPUFastSDFAO {
       root: 0, single: blas ? blas.single : true,
       qMin: blas ? blas.qMin : [0, 0, 0], qScale: blas ? blas.qScale : [0, 0, 0],
       triangles: blas ? blas.triCount : idx.length / 3,
+      meanAlbedo, sdfSlab: -1, sdfMin: [0, 0, 0], sdfInvSpan: 0,
     });
     return id;
   }
@@ -2106,7 +2189,8 @@ export class WebGPUFastSDFAO {
       f.set(w2l, base);
       f.set(l2w, base + 16);
       const [cx, cy, cz] = mesh.center;
-      const sMax = Math.max(Math.hypot(l2w[0], l2w[1], l2w[2]), Math.hypot(l2w[4], l2w[5], l2w[6]), Math.hypot(l2w[8], l2w[9], l2w[10]));
+      const axisScale = [Math.hypot(l2w[0], l2w[1], l2w[2]), Math.hypot(l2w[4], l2w[5], l2w[6]), Math.hypot(l2w[8], l2w[9], l2w[10])];
+      const sMax = Math.max(...axisScale);
       f[base + 32] = l2w[0] * cx + l2w[4] * cy + l2w[8] * cz + l2w[12];
       f[base + 33] = l2w[1] * cx + l2w[5] * cy + l2w[9] * cz + l2w[13];
       f[base + 34] = l2w[2] * cx + l2w[6] * cy + l2w[10] * cz + l2w[14];
@@ -2117,9 +2201,14 @@ export class WebGPUFastSDFAO {
       f.set([mesh.qMin[0], mesh.qMin[1], mesh.qMin[2], 0], base + 40);
       f.set([mesh.qScale[0], mesh.qScale[1], mesh.qScale[2], 0], base + 44);
       u32.set([mesh.kind, mesh.root, mesh.single ? 1 : 0, hasRough ? 1 : 0], base + 48);
+      // Baked-SDF mode: local box, smallest axis scale (keeps scaled distances conservative), slab, mean albedo
+      f.set([mesh.sdfMin[0], mesh.sdfMin[1], mesh.sdfMin[2], Math.min(...axisScale)], base + 52);
+      f.set([mesh.sdfInvSpan, mesh.sdfInvSpan, mesh.sdfInvSpan, mesh.kind === MOVER_KIND_SPHERE ? 0 : mesh.sdfSlab], base + 56);
+      f.set([col[0] * mesh.meanAlbedo[0], col[1] * mesh.meanAlbedo[1], col[2] * mesh.meanAlbedo[2], 0], base + 60);
       active.push({ mesh, index: active.length });
     }
     u32[0] = active.length;
+    u32[1] = this.moverTracing === 'sdf' ? 1 : 0;
     this.activeMoverCount = active.length;
     this.device.queue.writeBuffer(this.moverUBuf, 0, buf);
     return active;
@@ -2241,6 +2330,7 @@ export class WebGPUFastSDFAO {
       { binding: b0, resource: { buffer: this.moverUBuf } },
       { binding: b0 + 1, resource: { buffer: this.moverNodesBuf } },
       { binding: b0 + 2, resource: { buffer: this.moverTrisBuf } },
+      { binding: b0 + 3, resource: this.moverSdfAtlasView },
     ];
     this.relightDirectBG = d.createBindGroup({
       layout: this.relightDirectPipe.getBindGroupLayout(0),

@@ -6,12 +6,19 @@
 // world<->local transform; every ray (GI/AO, sun & orb shadows, glossy and mirror reflections) is
 // transformed into each candidate instance's local space and traced exactly against its triangles.
 // The transform is affine and the local direction is left unnormalized, so local t == world t.
+//
+// A second mode reproduces the original SDF method for comparison: every mesh is also baked into a
+// local signed distance field (one slab of a shared 3D atlas), and in that mode movers are min()'d into
+// the scene distance at their current transform, so every ray sphere-traces them like static geometry.
+// mv.count.y selects the mode: 0 = exact BVH tracing, 1 = baked SDF (original method).
 
 export const MAX_MOVERS = 8;
-export const MOVER_STRIDE_FLOATS = 52; // 2 x mat4 + 5 x vec4 = 208 B per instance
+export const MOVER_STRIDE_FLOATS = 64; // 2 x mat4 + 8 x vec4 = 256 B per instance
 export const MOVER_UBO_BYTES = 16 + MAX_MOVERS * MOVER_STRIDE_FLOATS * 4;
 export const MOVER_KIND_BVH = 0;
 export const MOVER_KIND_SPHERE = 1; // analytic unit sphere in local space (exact, no BLAS)
+export const MOVER_SDF_RES = 64;    // baked local SDF resolution per mesh (64^3 FP16 = 512 KiB)
+export const MOVER_SDF_SLABS = 16;  // meshes the shared SDF atlas holds (64 x 64 x 1024)
 const MAX_LEAF = 7;
 const SAH_BINS = 12;
 const SAH_MAX_DEPTH = 20; // deeper levels use median splits so traversal depth stays bounded
@@ -27,9 +34,12 @@ struct Mover {
   qMin: vec4<f32>,     // local-space BLAS quantization origin
   qScale: vec4<f32>,   // local-space BLAS quantization step (span / 65535)
   info: vec4<u32>,     // x=kind (0=triangle BLAS, 1=analytic unit sphere), y=root node, z=1 if root is one leaf, w=roughness override
+  sdfBox: vec4<f32>,   // baked-SDF mode: xyz=local SDF box min, w=local->world distance scale (smallest axis scale)
+  sdfInv: vec4<f32>,   // baked-SDF mode: xyz=1/box span, w=atlas slab (-1 = not baked)
+  sdfAlb: vec4<f32>,   // baked-SDF mode: rgb=mesh mean albedo x tint (no per-triangle colors in an SDF)
 };
 struct MoverU {
-  count: vec4<u32>,
+  count: vec4<u32>,    // x=active movers, y=mode (0=exact BVH, 1=baked SDF)
   m: array<Mover, ${MAX_MOVERS}>,
 };
 @group(0) @binding(${binding}) var<uniform> mv: MoverU;
@@ -42,11 +52,13 @@ fn mvNormalToWorld(i: u32, nl: vec3<f32>) -> vec3<f32> {
 `;
 }
 
-// Exact ray tracing against all mover instances. Requires moverUniformWGSL() in the same module.
-export function moverTraceWGSL(bindingNodes, bindingTris) {
+// Ray tracing against all mover instances: exact BVH hits (mode 0) and baked-SDF distance queries
+// (mode 1). Requires moverUniformWGSL() and a filtering sampler named linSamp in the same module.
+export function moverTraceWGSL(bindingNodes, bindingTris, bindingAtlas) {
   return /* wgsl */`
 @group(0) @binding(${bindingNodes}) var<storage, read> mvNodes: array<vec4<u32>>;
 @group(0) @binding(${bindingTris}) var<storage, read> mvTris: array<vec4<f32>>;
+@group(0) @binding(${bindingAtlas}) var mvSdfAtlas: texture_3d<f32>;
 
 struct MvHit {
   t: f32,         // world distance along the ray (< 0 on miss)
@@ -178,8 +190,10 @@ fn mvMayHit(i: u32, o: vec3<f32>, d: vec3<f32>, tMax: f32) -> bool {
 }
 
 // Closest exact hit over all mover instances for a unit-length world ray within (tMin, tMax).
+// Always a miss in baked-SDF mode, where movers live in the distance field instead.
 fn traceMovers(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> MvHit {
   var best = MvHit(-1.0, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0));
+  if (mv.count.y != 0u) { return best; }
   var tCur = tMax;
   let cnt = min(mv.count.x, ${MAX_MOVERS}u);
   for (var i = 0u; i < cnt; i++) {
@@ -209,8 +223,9 @@ fn traceMovers(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> MvHit {
   return best;
 }
 
-// Any-hit shadow/visibility query against all mover instances.
+// Any-hit shadow/visibility query against all mover instances (never occludes in baked-SDF mode).
 fn moversOccluded(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> bool {
+  if (mv.count.y != 0u) { return false; }
   let cnt = min(mv.count.x, ${MAX_MOVERS}u);
   for (var i = 0u; i < cnt; i++) {
     if (!mvMayHit(i, o, d, tMax)) { continue; }
@@ -225,6 +240,62 @@ fn moversOccluded(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> bool {
     }
   }
   return false;
+}
+
+// ---- Baked-SDF mode (the original method): movers answer distance queries, not ray queries ----
+
+fn mvSdfMode() -> bool { return mv.count.y == 1u && mv.count.x > 0u; }
+
+// Conservative world-space distance from p to mover i: the analytic sphere's exact distance, or the
+// mover's baked local SDF (trilinear, FP16). Outside the baked box the bound max(dBox, dEdge - dBox)
+// holds by the triangle inequality, so sphere tracing never steps through the mesh.
+fn mvSdfDistance(i: u32, p: vec3<f32>) -> f32 {
+  let lp = (mv.m[i].w2l * vec4<f32>(p, 1.0)).xyz;
+  let sc = mv.m[i].sdfBox.w;
+  if (mv.m[i].info.x == 1u) { return (length(lp) - 1.0) * sc; }
+  let slab = mv.m[i].sdfInv.w;
+  if (slab < 0.0) { return 1e4; }
+  let inv = mv.m[i].sdfInv.xyz;
+  let uvw = (lp - mv.m[i].sdfBox.xyz) * inv;
+  let dBox = length(max(max(-uvw, uvw - vec3<f32>(1.0)), vec3<f32>(0.0)) / inv);
+  let res = f32(textureDimensions(mvSdfAtlas).x);
+  let slabs = f32(textureDimensions(mvSdfAtlas).z) / res;
+  let q = clamp(uvw, vec3<f32>(0.0), vec3<f32>(1.0));
+  let qz = clamp(q.z, 0.5 / res, 1.0 - 0.5 / res); // stay inside this mesh's slab
+  let dEdge = textureSampleLevel(mvSdfAtlas, linSamp, vec3<f32>(q.x, q.y, (slab + qz) / slabs), 0.0).r;
+  return max(dBox, dEdge - dBox) * sc;
+}
+
+// Nearest mover closer than dCap: (distance, index) or (dCap, -1). Bounding spheres skip far movers.
+fn mvSdfClosest(p: vec3<f32>, dCap: f32) -> vec2<f32> {
+  var best = vec2<f32>(dCap, -1.0);
+  let cnt = min(mv.count.x, ${MAX_MOVERS}u);
+  for (var i = 0u; i < cnt; i++) {
+    let sph = mv.m[i].sphere;
+    if (length(p - sph.xyz) - sph.w >= best.x) { continue; }
+    let dm = mvSdfDistance(i, p);
+    if (dm < best.x) { best = vec2<f32>(dm, f32(i)); }
+  }
+  return best;
+}
+
+// Which mover a baked-SDF-mode march hit at p landed on: closer than eps and not behind static geometry.
+fn mvSdfHitIndex(p: vec3<f32>, staticD: f32, eps: f32) -> i32 {
+  if (!mvSdfMode()) { return -1; }
+  return i32(mvSdfClosest(p, min(staticD + 0.004, eps)).y);
+}
+
+// Surface normal from the mover's distance gradient (central differences), facing against rayDir.
+fn mvSdfNormal(i: u32, p: vec3<f32>, rayDir: vec3<f32>) -> vec3<f32> {
+  let h = 0.006;
+  let g = vec3<f32>(
+    mvSdfDistance(i, p + vec3<f32>(h, 0.0, 0.0)) - mvSdfDistance(i, p - vec3<f32>(h, 0.0, 0.0)),
+    mvSdfDistance(i, p + vec3<f32>(0.0, h, 0.0)) - mvSdfDistance(i, p - vec3<f32>(0.0, h, 0.0)),
+    mvSdfDistance(i, p + vec3<f32>(0.0, 0.0, h)) - mvSdfDistance(i, p - vec3<f32>(0.0, 0.0, h))
+  );
+  let l = length(g);
+  let n = select(-rayDir, g / l, l > 1e-8);
+  return select(n, -n, dot(n, rayDir) > 0.0);
 }
 `;
 }
@@ -425,6 +496,7 @@ export function buildMoverBLAS(positions, indices = null, triColors = null) {
     triCount,
     single,
     qMin,
+    span,
     qScale: span.map(s => s / 65535),
   };
 }
