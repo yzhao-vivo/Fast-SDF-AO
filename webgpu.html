@@ -22,6 +22,11 @@ canvas{display:block;width:100%;height:auto}
 #hud strong{font-size:19px}
 #hud small{display:block;color:#94a3b8}
 #status{display:block;margin-top:10px;color:#c4d0db;font-variant-numeric:tabular-nums}
+#bench-out{margin-top:12px;overflow-x:auto}
+#bench-out table{border-collapse:collapse;font-variant-numeric:tabular-nums;min-width:520px}
+#bench-out th,#bench-out td{padding:6px 12px;border-bottom:1px solid #334155;text-align:right}
+#bench-out th:first-child,#bench-out td:first-child{text-align:left}
+#bench-out p{margin:6px 0 0;color:#94a3b8;font-size:13px}
 #err{display:none;padding:18px;background:#2a171c;border:1px solid #f43f5e;border-radius:8px;margin-bottom:14px;color:#fecdd3}
 </style>
 <main>
@@ -35,6 +40,7 @@ canvas{display:block;width:100%;height:auto}
     <button data-scene="gallery" aria-pressed="true">Gallery (Multi-Bounce GI)</button>
     <button data-scene="atrium" aria-pressed="false">Atrium (Curved)</button>
     <button data-scene="archive" aria-pressed="false">Archive (Boxes)</button>
+    <button data-scene="stress" aria-pressed="false" title="Curved Atrium + 8 movers, ~266k moving triangles (Stanford dragon 202k)">Stress test (8 movers)</button>
     <button id="load-btn" style="border-color:#38bdf8;color:#bae6fd">Load .glb / .obj</button>
     <input id="file-in" type="file" accept=".glb,.gltf,.obj" style="display:none">
     <select id="quality" aria-label="Quality">
@@ -64,6 +70,7 @@ canvas{display:block;width:100%;height:auto}
     </span>
     <label>Sun <input id="sun" type="range" min="-65" max="65" value="22" step="1" style="width:90px"><span id="sun-val" style="min-width:32px">22°</span></label>
     <button id="clear">Clear Cache</button>
+    <button id="bench-btn" title="Times no movers (cache on / off), Exact BVH and Baked SDF movers on the current scene">Run benchmark</button>
   </nav>
   <div id="view">
     <canvas id="c" width="1280" height="720"></canvas>
@@ -71,6 +78,7 @@ canvas{display:block;width:100%;height:auto}
     <output id="hud"><strong id="fps">— FPS</strong><small id="gpu-ms">GPU: — ms · Cache skip: —%</small></output>
   </div>
   <output id="status">Initializing WebGPU Compute…</output>
+  <div id="bench-out" hidden></div>
 </main>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
 <script type="module">
@@ -81,6 +89,7 @@ import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { buildContactBVH } from './contact-bvh.js';
 import { WebGPUFastSDFAO, WEBGPU_QUALITY_PRESETS } from './src/webgpu.js';
+import { addStressMeshes, stressMovers, STRESS_CAMERA } from './assets/mover-stress-scene.js';
 
 const statusEl = document.querySelector('#status');
 const errEl = document.querySelector('#err');
@@ -189,8 +198,10 @@ try {
     return moverMat.compose(new T.Vector3(...pos), moverQuat, new T.Vector3(1, 1, 1)).elements.slice();
   }
 
+  let moverLayout = 'gallery', stressSet = null;
   function updateMovers(t) {
     if (!moversOn) { gpu.dynObjects = []; return; }
+    if (moverLayout === 'stress' && stressSet) { gpu.dynObjects = stressMovers(stressSet, t); return; }
     // Three movers phase-locked 120 degrees apart on one collision-free elevated orbit around the pedestal
     const a1 = t * 1.05, a2 = a1 + (2 * Math.PI) / 3, a3 = a1 + (4 * Math.PI) / 3;
     const orbit = (a, h, dh) => [1.80 * Math.cos(a), -0.15 + 1.36 * Math.sin(a), h + dh * Math.sin(a * 2.0)];
@@ -272,19 +283,39 @@ try {
     return sceneCache[name];
   }
 
+  // Stress test = the curved Atrium + 8 heavy movers (assets/mover-stress-scene.js)
+  function stressMoverTris() {
+    if (!stressSet) return 0;
+    const st = stressSet.stats;
+    return st.dragon.triangles + 2 * st.bunny.triangles + st.plate.triangles + st.teapot.triangles + st.knot.triangles + st.ring.triangles;
+  }
   async function selectScene(name) {
+    const stress = name === 'stress';
     activeScene = name;
     document.querySelectorAll('button[data-scene]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.scene === name)));
-    const sc = await loadSceneData(name);
+    const sc = await loadSceneData(stress ? 'atrium' : name);
     gpu.sunDir = name === 'archive' ? [-0.33, -0.45, 0.83] : sunDirFromDeg(sunDeg);
     gpu.emissiveCol = (emissiveOn && name === 'gallery') ? [3.6, 2.0, 0.6] : [0, 0, 0];
     gpu.loadScene(sc);
-    camera.position.set(...sc.cam.position);
-    controls.target.set(...sc.cam.target);
+    const cam = stress ? STRESS_CAMERA : sc.cam;
+    camera.position.set(...cam.position);
+    controls.target.set(...cam.target);
     controls.update();
+    let extra = '';
+    if (stress) {
+      if (!stressSet) {
+        statusEl.value = 'Loading the stress-test meshes (Stanford dragon 202k tris, bunny) and building their BVHs…';
+        stressSet = await addStressMeshes(gpu);
+      }
+      moversOn = true;
+      document.querySelector('#movers').checked = true;
+      extra = ` · 8 movers, ${stressMoverTris().toLocaleString()} moving tris`;
+    }
+    moverLayout = stress ? 'stress' : 'gallery';
+    updateMovers(simTime);
     const info = gpu.adapterInfo;
     const devLabel = info.description || info.architecture || info.vendor || 'WebGPU';
-    statusEl.value = `${name.toUpperCase()} · ${devLabel} · ${(sc.indices.length / 3).toLocaleString()} tris · ${sc.bvh.nodes.toLocaleString()} BVH nodes · 262k SHaRC hash slots`;
+    statusEl.value = `${name.toUpperCase()} · ${devLabel} · ${(sc.indices.length / 3).toLocaleString()} tris · ${sc.bvh.nodes.toLocaleString()} BVH nodes · 262k SHaRC hash slots${extra}`;
   }
 
   document.querySelectorAll('button[data-scene]').forEach(b => { b.onclick = () => selectScene(b.dataset.scene); });
@@ -315,6 +346,91 @@ try {
       : 'Mover rays: Exact BVH, rays transformed into each mover\'s local space and intersected with its triangles';
   }
   moverModeBtns.forEach(b => { b.onclick = () => setMoverTracing(b.dataset.moverMode); });
+
+  // ---- Benchmark: cost of moving objects on the current scene ----
+  // Four conditions, each `warmup` + `frames` frames with movers animating at 60 Hz sim time and a still
+  // camera. GPU ms = timestamp query from G-buffer start to composite end (when the adapter supports
+  // 'timestamp-query'); frame ms = CPU submit until the queue is idle. "No movers, cache off" does the
+  // same per-pixel work as the mover runs (movers always bypass the SHaRC cache), so it is the baseline.
+  const benchBtn = document.querySelector('#bench-btn');
+  const benchOut = document.querySelector('#bench-out');
+  const escapeHtml = (v) => String(v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  async function runBenchmark({ warmup = 30, frames = 120 } = {}) {
+    const saved = { moversOn, useHash: gpu.useHash, tracing: gpu.moverTracing };
+    const wasRunning = running;
+    running = false;
+    benchBtn.disabled = true;
+    const conds = [
+      { label: 'No movers, SHaRC cache on', movers: false, hash: true },
+      { label: 'No movers, cache off (baseline)', movers: false, hash: false },
+      { label: 'Movers: Exact BVH', movers: true, hash: true, mode: 'bvh' },
+      { label: 'Movers: Baked SDF (original)', movers: true, hash: true, mode: 'sdf' },
+    ];
+    const median = (a) => { const v = [...a].sort((x, y) => x - y); return v.length ? v[v.length >> 1] : NaN; };
+    const rows = [];
+    let t = simTime;
+    try {
+      for (const c of conds) {
+        statusEl.value = `Benchmark: ${c.label} (${warmup} + ${frames} frames)…`;
+        moversOn = c.movers;
+        gpu.useHash = c.hash;
+        if (c.mode) gpu.setMoverTracing(c.mode);
+        gpu.clearHash();
+        const gpuMs = [], frameMs = [];
+        for (let i = 0; i < warmup + frames; i++) {
+          t += 1 / 60;
+          updateMovers(t);
+          const t0 = performance.now();
+          renderOnce();
+          await gpu.device.queue.onSubmittedWorkDone();
+          const dt = performance.now() - t0;
+          await new Promise(r => setTimeout(r, 0)); // let the timestamp readback resolve
+          if (i >= warmup) {
+            frameMs.push(dt);
+            if (gpu.hasTimestamp && gpu.lastGpuMs > 0) gpuMs.push(gpu.lastGpuMs);
+          }
+        }
+        rows.push({ label: c.label, gpuMs: median(gpuMs), frameMs: median(frameMs) });
+      }
+    } finally {
+      moversOn = saved.moversOn;
+      document.querySelector('#movers').checked = moversOn;
+      gpu.useHash = saved.useHash;
+      document.querySelector('#hash').checked = saved.useHash;
+      gpu.setMoverTracing(saved.tracing);
+      gpu.clearHash();
+      updateMovers(simTime);
+      benchBtn.disabled = false;
+      if (wasRunning) { running = true; requestAnimationFrame(loop); }
+    }
+    const info = gpu.adapterInfo;
+    const meta = {
+      device: info.description || info.architecture || info.vendor || 'WebGPU',
+      scene: activeScene, quality: gpu.quality, resolution: `${gpu.width}×${gpu.height}`, warmup, frames,
+      movers: activeScene === 'stress' ? `8 movers, ${stressMoverTris().toLocaleString()} moving tris` : `${gpu.activeMoverCount || 3} movers`,
+    };
+    const base = rows[1];
+    const fmt = (v) => Number.isFinite(v) ? v.toFixed(2) : '—';
+    const rel = (r) => {
+      const a = Number.isFinite(r.gpuMs) && Number.isFinite(base.gpuMs) ? [r.gpuMs, base.gpuMs] : [r.frameMs, base.frameMs];
+      return r === base ? '—' : `${a[0] >= a[1] ? '+' : ''}${(a[0] - a[1]).toFixed(2)} ms`;
+    };
+    const md = [`Fast-SDF-AO mover benchmark · ${meta.device} · ${meta.scene} · ${meta.quality} · ${meta.resolution} · ${meta.movers} · median of ${frames} frames`, '',
+      '| Condition | GPU ms | Frame ms | vs baseline |', '|---|---:|---:|---:|',
+      ...rows.map(r => `| ${r.label} | ${fmt(r.gpuMs)} | ${fmt(r.frameMs)} | ${rel(r)} |`)].join('\n');
+    benchOut.hidden = false;
+    benchOut.innerHTML = `<table><thead><tr><th>Condition</th><th>GPU ms</th><th>Frame ms</th><th>vs baseline</th></tr></thead><tbody>${
+      rows.map(r => `<tr><td>${escapeHtml(r.label)}</td><td>${fmt(r.gpuMs)}</td><td>${fmt(r.frameMs)}</td><td>${rel(r)}</td></tr>`).join('')
+    }</tbody></table><p>${escapeHtml(`${meta.device} · ${meta.scene} · ${meta.quality} · ${meta.resolution} · ${meta.movers} · median of ${frames} frames after ${warmup} warm-up`)}${
+      gpu.hasTimestamp ? '' : ' · GPU timestamps unavailable in this browser, compare Frame ms'}</p><p><button id="bench-copy">Copy results</button></p>`;
+    document.querySelector('#bench-copy').onclick = async (e) => {
+      try { await navigator.clipboard.writeText(md); e.target.textContent = 'Copied'; }
+      catch { e.target.textContent = 'Copy failed: select the table instead'; }
+    };
+    statusEl.value = 'Benchmark finished';
+    return { rows, meta, markdown: md };
+  }
+  benchBtn.onclick = () => runBenchmark();
   document.querySelector('#sun').oninput = e => {
     sunDeg = Number(e.target.value);
     document.querySelector('#sun-val').textContent = `${sunDeg}°`;
@@ -525,6 +641,8 @@ try {
     loadCustomMoverOBJ: async (objText, name = 'mover.obj') => loadCustomMover(new OBJLoader().parse(objText), name),
     moverMeshes: { teapot: teapotMesh, knot: knotMesh },
     setMoverTracing,
+    runBenchmark,
+    getStressSet: () => stressSet,
     setMovers: (on, t = 0.6) => {
       moversOn = !!on;
       document.querySelector('#movers').checked = moversOn;

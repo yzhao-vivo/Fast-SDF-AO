@@ -1,5 +1,7 @@
 // trace_gi: independent 512-ray 1-bounce diffuse GI + AO reference ray tracer.
-//   trace_gi gi_tris.f32 samples.f32 out_ref.f32 sx sy sz
+//   trace_gi gi_tris.f32 samples.f32 out_ref.f32 sx sy sz [out_sun.f32]
+// out_sun.f32 (optional): 1 float per pixel, soft sun visibility from 64 stratified shadow rays over a
+// 1.6-degree solar disk (cone radius 0.028 rad, as the WebGPU renderer jitters its sun shadow rays).
 // gi_tris.f32: 15 floats per triangle (v0, v1, v2, unitNormal, avgAlbedo).
 // samples.f32: 9 floats per pixel (pos, nor, albedo).
 // out_ref.f32: 10 floats per pixel (ao, giR, giG, giB, aoOnlyR, aoOnlyG, aoOnlyB, giRgbR, giRgbG, giRgbB).
@@ -159,10 +161,11 @@ static inline V toneSrgb(V c) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 7) {
-        std::fprintf(stderr, "usage: trace_gi gi_tris.f32 samples.f32 out_ref.f32 sx sy sz\n");
+    if (argc != 7 && argc != 8) {
+        std::fprintf(stderr, "usage: trace_gi gi_tris.f32 samples.f32 out_ref.f32 sx sy sz [out_sun.f32]\n");
         return 2;
     }
+    const bool wantSun = argc == 8;
     auto tris = load<GiTri>(argv[1]);
     auto samples = load<float>(argv[2]);
     const size_t n = samples.size() / 9;
@@ -177,6 +180,9 @@ int main(int argc, char** argv) {
 
     BVH bvh(tris);
     std::vector<float> out(n * 10, 0.f);
+    std::vector<float> sunOut(wantSun ? n : 0, 0.f);
+    V sunT = norm(cross(sunDir, std::fabs(sunDir.x) < 0.9f ? V{1, 0, 0} : V{0, 1, 0}));
+    V sunB = cross(sunDir, sunT);
     std::atomic<size_t> next{0};
 
     auto work = [&] {
@@ -235,6 +241,21 @@ int main(int argc, char** argv) {
                 V colAO = toneSrgb(mul(mul3(alb, add(direct, skyInd)), 0.88f));
                 V colGI = toneSrgb(mul(mul3(alb, add(add(direct, skyInd), giIrr)), 0.88f));
 
+                if (wantSun) {
+                    // Soft sun visibility: 8 x 8 stratified samples over the solar disk
+                    int vis = 0;
+                    V so = add(p, mul(nor, 0.004f));
+                    for (int a = 0; a < 8; ++a) {
+                        for (int b = 0; b < 8; ++b) {
+                            float r = 0.028f * std::sqrt((a + rand01(rng)) / 8.f);
+                            float ph = 6.283185307f * (b + rand01(rng)) / 8.f;
+                            V d = norm(add(sunDir, add(mul(sunT, r * std::cos(ph)), mul(sunB, r * std::sin(ph)))));
+                            if (dot(d, nor) > 0.f && !bvh.any(so, d, 12.f)) vis++;
+                        }
+                    }
+                    sunOut[i] = float(vis) / 64.f;
+                }
+
                 float* o = &out[i * 10];
                 o[0] = ao;
                 o[1] = giIrr.x; o[2] = giIrr.y; o[3] = giIrr.z;
@@ -248,5 +269,6 @@ int main(int argc, char** argv) {
     for (auto& th : pool) th.join();
 
     std::ofstream(argv[3], std::ios::binary).write((const char*)out.data(), out.size() * sizeof(float));
+    if (wantSun) std::ofstream(argv[7], std::ios::binary).write((const char*)sunOut.data(), sunOut.size() * sizeof(float));
     std::printf("trace_gi: %zu tris, %zu pixels x %d rays\n", tris.size(), n, RAYS);
 }
