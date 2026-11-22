@@ -10,7 +10,7 @@
 import { bakeSDFOnGPU } from './webgpu-bake.js';
 import { REFL_TRACE_WGSL, REFL_FILTER_WGSL } from './webgpu-refl.js';
 import {
-  MAX_MOVERS, MOVER_STRIDE_FLOATS, MOVER_UBO_BYTES, MOVER_KIND_BVH, MOVER_KIND_SPHERE, MOVER_SDF_RES, MOVER_SDF_SLABS,
+  MAX_MOVERS, MOVER_STRIDE_FLOATS, MOVER_HEADER_FLOATS, MOVER_UBO_BYTES, MOVER_KIND_BVH, MOVER_KIND_SPHERE, MOVER_SDF_RES, MOVER_SDF_SLABS,
   moverUniformWGSL, moverTraceWGSL, buildMoverBLAS, packMoverBLAS, computeVertexNormals, composeMat4, invertMat4,
 } from './webgpu-movers.js';
 
@@ -1425,10 +1425,81 @@ fn compMoverRad(hitP: vec3<f32>, n: vec3<f32>, alb: vec3<f32>, R: vec3<f32>) -> 
   return alb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
 }
 
-// Full-resolution 1280x720 exact mirror chrome trace (runs ONLY on mirror pixels: <1.5% of screen!)
-// Zero half-res stair-stepping, zero temporal smear, pixel-sharp G-buffer + 360-deg radVol fallback.
+fn compSky(R: vec3<f32>) -> vec3<f32> {
+  let skyT = clamp(R.z * 0.5 + 0.5, 0.0, 1.0);
+  let sDir = normalize(u.sunDir.xyz);
+  let sunDisc = pow(max(dot(R, sDir), 0.0), 36.0) * vec3<f32>(3.2, 2.9, 2.4);
+  let keyBox = pow(max(dot(R, normalize(vec3<f32>(0.55, -0.62, 0.56))), 0.0), 10.0) * vec3<f32>(1.35, 1.28, 1.18);
+  let rimBox = pow(max(dot(R, normalize(vec3<f32>(-0.72, -0.35, 0.58))), 0.0), 8.0) * vec3<f32>(0.75, 0.92, 1.15);
+  let softBox = smoothstep(0.35, 0.92, R.z) * vec3<f32>(0.55, 0.62, 0.72);
+  return mix(vec3<f32>(0.22, 0.24, 0.28), vec3<f32>(0.62, 0.72, 0.88), skyT) + sunDisc + keyBox + rimBox + softBox;
+}
+
+// Ray distance to the emissive orb (1e9 when there is no orb or no hit before tMax).
+fn compOrbT(ro: vec3<f32>, R: vec3<f32>, tMax: f32) -> f32 {
+  if (dot(u.emissiveCol.rgb, u.emissiveCol.rgb) <= 1e-4) { return 1e9; }
+  let oc = ro - u.emissivePos.xyz;
+  let b = dot(oc, R);
+  let c = dot(oc, oc) - u.emissivePos.w * u.emissivePos.w;
+  let disc = b * b - c;
+  if (disc < 0.0) { return 1e9; }
+  let t0 = -b - sqrt(disc);
+  return select(1e9, t0, t0 > 0.02 && t0 < tMax);
+}
+
+// Soft sun visibility at an off-screen reflection hit: exact movers, then the scene SDF.
+fn compSunVis(p: vec3<f32>, sDir: vec3<f32>) -> f32 {
+  if (moversOccluded(p, sDir, 0.0, 30.0)) { return 0.0; }
+  var t = 0.06;
+  var res = 1.0;
+  for (var k = 0u; k < 32u; k++) {
+    let d = compSampleSDF(p + sDir * t);
+    if (d > 100.0) { break; }
+    if (d < 0.01) { return 0.0; }
+    res = min(res, 8.0 * d / t);
+    t += max(d * 0.9, 0.05);
+    if (t > 25.0) { break; }
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+// Diffuse radiance leaving an exact reflection hit: the G-buffer's lighting when the hit is on screen
+// (shadows, GI, AO). Off screen: crisp direct sun (shadow ray) plus a smooth sky/bounce ambient on the
+// exact normal and albedo. (The coarse radiance volume is not used here: its voxels would show through
+// as blocky shading in mirror reflections.)
+fn compExactHitRad(hp: vec3<f32>, h: MvHit, R: vec3<f32>) -> vec3<f32> {
+  let sc = compScreenRad(hp, R);
+  if (sc.a > 0.5) { return sc.rgb; }
+  let sDir = normalize(u.sunDir.xyz);
+  let ndl = max(0.0, dot(h.n, sDir));
+  var vis = 0.0;
+  if (ndl > 0.0) { vis = compSunVis(hp + h.n * 0.02, sDir); }
+  let skyT = clamp(h.n.z * 0.5 + 0.5, 0.0, 1.0);
+  return h.alb * (vec3<f32>(2.25, 2.10, 1.85) * ndl * vis + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.9);
+}
+
+// Exact mirror reflection: triangle hits on the static scene and the movers, and one more mirror bounce
+// off a metal hit (a mirror seen in a mirror), tinted by that metal's albedo (its F0).
+fn traceMirrorExact(ro: vec3<f32>, R: vec3<f32>) -> vec3<f32> {
+  let orbT = compOrbT(ro, R, 60.0);
+  let h = traceScene(ro, R, 0.001, min(orbT, 60.0));
+  if (h.t < 0.0) { return select(compSky(R), u.emissiveCol.rgb * 1.9, orbT < 1e8); }
+  let hp = ro + R * h.t;
+  if (h.metal < 0.5) { return compExactHitRad(hp, h, R); }
+  let R2 = reflect(R, h.n);
+  let ro2 = hp + h.n * 0.003;
+  let orb2 = compOrbT(ro2, R2, 60.0);
+  let h2 = traceScene(ro2, R2, 0.001, min(orb2, 60.0));
+  var c2 = select(compSky(R2), u.emissiveCol.rgb * 1.9, orb2 < 1e8);
+  if (h2.t > 0.0) { c2 = compExactHitRad(ro2 + R2 * h2.t, h2, R2); }
+  return h.alb * c2;
+}
+
+// Full-resolution 1280x720 mirror trace (runs ONLY on mirror pixels). Exact triangle reflections when
+// enabled; otherwise sphere-traces the scene SDF with a pixel-sharp G-buffer + 360-deg radVol fallback.
 fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
   let R = reflect(-V, n);
+  if (mv.count.z != 0u) { return traceMirrorExact(p + n * 0.004, R); }
   let ro = p + n * 0.032 + R * 0.02;
   var hitDist = 10.5;
   var hitAny = false;
@@ -1461,15 +1532,7 @@ fn traceMirrorFullRes(p: vec3<f32>, n: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
   let mh = traceMovers(ro, R, 0.002, min(hitDist, orbT));
   if (mh.t > 0.0) { return compMoverRad(ro + R * mh.t, mh.n, mh.alb, R); }
   if (orbT < hitDist) { return u.emissiveCol.rgb * 1.9; }
-  if (!hitAny) {
-    let skyT = clamp(R.z * 0.5 + 0.5, 0.0, 1.0);
-    let sDir = normalize(u.sunDir.xyz);
-    let sunDisc = pow(max(dot(R, sDir), 0.0), 36.0) * vec3<f32>(3.2, 2.9, 2.4);
-    let keyBox = pow(max(dot(R, normalize(vec3<f32>(0.55, -0.62, 0.56))), 0.0), 10.0) * vec3<f32>(1.35, 1.28, 1.18);
-    let rimBox = pow(max(dot(R, normalize(vec3<f32>(-0.72, -0.35, 0.58))), 0.0), 8.0) * vec3<f32>(0.75, 0.92, 1.15);
-    let softBox = smoothstep(0.35, 0.92, R.z) * vec3<f32>(0.55, 0.62, 0.72);
-    return mix(vec3<f32>(0.22, 0.24, 0.28), vec3<f32>(0.62, 0.72, 0.88), skyT) + sunDisc + keyBox + rimBox + softBox;
-  }
+  if (!hitAny) { return compSky(R); }
   let hitP = ro + R * hitDist;
   // Baked-SDF mover mode: the march itself may have landed on a mover
   let mi = mvSdfHitIndex(hitP, compSampleStaticSDF(hitP), 0.05);
@@ -2017,6 +2080,10 @@ export class WebGPUFastSDFAO {
     // How secondary rays see moving objects: 'bvh' = exact triangle tracing (default),
     // 'sdf' = baked local SDF min()'d into the scene distance (the original SDF method, for comparison).
     this.moverTracing = 'bvh';
+    // Mirror and glossy reflection rays hit the static scene's exact triangles (a BLAS built in loadScene)
+    // instead of sphere-tracing its SDF, and bounce once more off metal hits. false = SDF reflections.
+    this.exactReflections = true;
+    this.staticBlas = null;
     // Shared atlas of per-mesh baked SDFs: MOVER_SDF_SLABS slabs of MOVER_SDF_RES^3, stacked along Z.
     this.moverSdfAtlas = this.device.createTexture({
       size: [MOVER_SDF_RES, MOVER_SDF_RES, MOVER_SDF_RES * MOVER_SDF_SLABS],
@@ -2057,6 +2124,15 @@ export class WebGPUFastSDFAO {
           for (let k = 0; k < 3; k++) triColors[t * 3 + k] += colors[vi * 3 + k] / 3;
         }
         for (let k = 0; k < 3; k++) meanAlbedo[k] += triColors[t * 3 + k] / triCount;
+      }
+    }
+    if (roughness) { // mark metal triangles (average vertex roughness < 0) with a negative red lane
+      const triCount = idx ? idx.length / 3 : vCount / 3;
+      if (!triColors) triColors = new Float32Array(triCount * 3).fill(1);
+      for (let t = 0; t < triCount; t++) {
+        let r = 0;
+        for (let v = 0; v < 3; v++) r += roughness[idx ? idx[t * 3 + v] : t * 3 + v] / 3;
+        if (r < 0) triColors[t * 3] = -Math.max(triColors[t * 3], 1e-3);
       }
     }
     const blas = buildMoverBLAS(positions, idx, triColors);
@@ -2158,11 +2234,13 @@ export class WebGPUFastSDFAO {
     return id;
   }
 
-  // Concatenate all mesh BLASes into the shared storage buffers and rebase their roots.
-  _packMovers() {
+  // Concatenate the static-scene BLAS and all mover mesh BLASes into the shared storage buffers.
+  _packMovers(rebuildBindGroups = true) {
     const d = this.device;
     const meshes = [...this.moverMeshes.values()].filter(m => m.blas);
-    const packed = packMoverBLAS(meshes.map(m => m.blas));
+    const list = meshes.map(m => m.blas);
+    if (this.staticBlas) list.unshift(this.staticBlas);
+    const packed = packMoverBLAS(list);
     for (const m of meshes) m.root = m.blas.nodeBase;
     if (this.moverNodesBuf) this.moverNodesBuf.destroy();
     if (this.moverTrisBuf) this.moverTrisBuf.destroy();
@@ -2170,7 +2248,13 @@ export class WebGPUFastSDFAO {
     d.queue.writeBuffer(this.moverNodesBuf, 0, packed.nodes);
     this.moverTrisBuf = d.createBuffer({ size: packed.tris.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     d.queue.writeBuffer(this.moverTrisBuf, 0, packed.tris);
-    if (this.sceneRes) this._rebuildBindGroups();
+    if (rebuildBindGroups && this.sceneRes) this._rebuildBindGroups();
+  }
+
+  /** Exact triangle reflections of the static scene (true) or SDF-traced reflections (false). */
+  setExactReflections(on) {
+    this.exactReflections = !!on;
+    this.stillFrames = 0;
   }
 
   // Upload this frame's mover instances; returns the drawable list (index = firstInstance).
@@ -2185,7 +2269,7 @@ export class WebGPUFastSDFAO {
       const l2w = o.matrix ? Float32Array.from(o.matrix) : composeMat4(o.pos || [0, 0, 0], o.rotation || [0, 0, 0, 1], o.scale ?? o.radius ?? 1);
       const w2l = invertMat4(l2w);
       if (!w2l) continue;
-      const base = 4 + active.length * MOVER_STRIDE_FLOATS;
+      const base = MOVER_HEADER_FLOATS + active.length * MOVER_STRIDE_FLOATS;
       f.set(w2l, base);
       f.set(l2w, base + 16);
       const [cx, cy, cz] = mesh.center;
@@ -2209,6 +2293,12 @@ export class WebGPUFastSDFAO {
     }
     u32[0] = active.length;
     u32[1] = this.moverTracing === 'sdf' ? 1 : 0;
+    const sb = this.staticBlas;
+    u32[2] = this.exactReflections && sb ? 1 : 0;
+    u32[3] = 0;
+    u32.set([sb ? sb.nodeBase : 0, sb && sb.single ? 1 : 0, 0, 0], 4);
+    f.set([sb ? sb.qMin[0] : 0, sb ? sb.qMin[1] : 0, sb ? sb.qMin[2] : 0, 0], 8);
+    f.set([sb ? sb.qScale[0] : 0, sb ? sb.qScale[1] : 0, sb ? sb.qScale[2] : 0, 0], 12);
     this.activeMoverCount = active.length;
     this.device.queue.writeBuffer(this.moverUBuf, 0, buf);
     return active;
@@ -2266,6 +2356,22 @@ export class WebGPUFastSDFAO {
     const idxArr = indices instanceof Uint32Array ? indices : new Uint32Array(indices);
     const ib = d.createBuffer({ size: Math.ceil(idxArr.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
     d.queue.writeBuffer(ib, 0, idxArr);
+
+    // Exact static-scene BLAS for reflection rays: per-triangle albedo, red lane negated on metal triangles
+    // (average vertex roughness < 0). Shares the mover BLAS buffers (packed first).
+    const triCount = idxArr.length / 3;
+    const triColors = new Float32Array(triCount * 3);
+    for (let t = 0; t < triCount; t++) {
+      let rough = 0;
+      for (let v = 0; v < 3; v++) {
+        const vi = idxArr[t * 3 + v];
+        for (let k = 0; k < 3; k++) triColors[t * 3 + k] += inter[vi * 10 + 6 + k] / 3;
+        rough += inter[vi * 10 + 9] / 3;
+      }
+      if (rough < 0) triColors[t * 3] = -Math.max(triColors[t * 3], 1e-3);
+    }
+    this.staticBlas = buildMoverBLAS(positions, idxArr, triColors);
+    this._packMovers(false);
 
     // Use GPU-baked SDF texture directly if provided, else upload FP16 3D SDF texture
     let sdfTex = gpuSdfTex;

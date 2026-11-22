@@ -60,6 +60,7 @@ canvas{display:block;width:100%;height:auto}
       <option value="4">View: Glossy Reflections</option>
     </select>
     <label><input id="refl" type="checkbox" checked> Reflections</label>
+    <label title="Reflection rays hit the static scene's exact triangles (and bounce once more off metal) instead of sphere-tracing its SDF"><input id="exact-refl" type="checkbox" checked> Exact reflections</label>
     <label><input id="hash" type="checkbox" checked> SHaRC Hash</label>
     <label><input id="reuse" type="checkbox" checked> 2×2 Reuse</label>
     <label><input id="emissive" type="checkbox"> Emissive Orb</label>
@@ -330,6 +331,7 @@ try {
   };
   document.querySelector('#viewmode').onchange = e => { gpu.viewMode = Number(e.target.value); };
   document.querySelector('#refl').onchange = e => { gpu.useReflections = e.target.checked; gpu.stillFrames = 0; };
+  document.querySelector('#exact-refl').onchange = e => { gpu.setExactReflections(e.target.checked); };
   document.querySelector('#hash').onchange = e => { gpu.useHash = e.target.checked; };
   document.querySelector('#reuse').onchange = e => { gpu.reuseEnabled = e.target.checked; };
   document.querySelector('#emissive').onchange = e => {
@@ -646,6 +648,7 @@ try {
     loadCustomMoverOBJ: async (objText, name = 'mover.obj') => loadCustomMover(new OBJLoader().parse(objText), name),
     moverMeshes: { teapot: teapotMesh, knot: knotMesh },
     setMoverTracing,
+    setExactReflections: (on) => { gpu.setExactReflections(on); document.querySelector('#exact-refl').checked = !!on; },
     runBenchmark,
     getStressSet: () => stressSet,
     getStaticSceneData: () => sceneCache[activeScene === 'stress' ? 'atrium' : activeScene],

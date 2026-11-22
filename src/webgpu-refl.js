@@ -2,6 +2,7 @@
 // - 1 GGX-importance-sampled reflection ray per half-res pixel (roughness < 0.72)
 // - Hybrid trace: Storage-buffer Dual-Child SAH BVH2 (near contact) -> FP16 SDF (far) -> radVol + direct Emissive Orb hit
 // - Exact hits on arbitrary-mesh moving objects (per-mesh local BLAS, see webgpu-movers.js)
+// - Exact static-scene reflections (scene BLAS) with one extra mirror bounce off metal hits, when enabled
 // - Temporal reprojection EMA + roughness-guided 3x3 bilateral spatial filter
 
 import { moverUniformWGSL, moverTraceWGSL } from './webgpu-movers.js';
@@ -147,6 +148,23 @@ fn evalMoverHitRadiance(hitP: vec3<f32>, hn: vec3<f32>, alb: vec3<f32>, rayDir: 
   let sun = max(0.0, dot(hn, sDir));
   let skyT = clamp(hn.z * 0.5 + 0.5, 0.0, 1.0);
   return alb * (vec3<f32>(2.25, 2.10, 1.85) * sun + mix(vec3<f32>(0.25, 0.23, 0.21), vec3<f32>(0.68, 0.79, 0.96), skyT) * 0.45);
+}
+
+// Studio sky gradient + 3-point softbox/sun lobes (widened with roughness) for rays that escape.
+fn reflSky(R: vec3<f32>, rough: f32) -> vec3<f32> {
+  let skyT = clamp(R.z * 0.5 + 0.5, 0.0, 1.0);
+  let sDir = normalize(u.sunDir.xyz);
+  let sunDisc = pow(max(dot(R, sDir), 0.0), mix(36.0, 5.0, rough)) * vec3<f32>(2.8, 2.5, 2.1);
+  let keyBox = pow(max(dot(R, normalize(vec3<f32>(0.55, -0.62, 0.56))), 0.0), mix(10.0, 3.0, rough)) * vec3<f32>(1.15, 1.08, 0.98);
+  let rimBox = pow(max(dot(R, normalize(vec3<f32>(-0.72, -0.35, 0.58))), 0.0), mix(8.0, 3.0, rough)) * vec3<f32>(0.65, 0.82, 1.05);
+  let softBox = smoothstep(0.35, 0.92, R.z) * vec3<f32>(0.48, 0.54, 0.64);
+  return mix(vec3<f32>(0.22, 0.24, 0.28), vec3<f32>(0.62, 0.72, 0.88), skyT) + sunDisc + keyBox + rimBox + softBox;
+}
+
+// Radiance leaving an exact (triangle) reflection hit on the static scene or a mover.
+fn reflHitRad(hp: vec3<f32>, h: MvHit, R: vec3<f32>) -> vec3<f32> {
+  if (h.mover > 0.5) { return evalMoverHitRadiance(hp, h.n, h.alb, R); }
+  return evalHitRadiance(hp, R);
 }
 
 fn boxHit(nd: vec4<u32>, qInv: vec3<f32>, qOff: vec3<f32>, tMax: f32) -> f32 {
@@ -320,6 +338,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
+  if (mv.count.z != 0u) {
+    // Exact triangle hits on the static scene and the movers, and one more mirror bounce off metal hits
+    let h = traceScene(origin, R, 0.001, min(hitDist, orbT));
+    if (h.t > 0.0) {
+      hitAny = true;
+      hitDist = h.t;
+      let hp = origin + R * h.t;
+      if (h.metal < 0.5) {
+        rad = reflHitRad(hp, h, R);
+      } else {
+        let R2 = reflect(R, h.n);
+        let ro2 = hp + h.n * 0.003;
+        let h2 = traceScene(ro2, R2, 0.001, u.params.w);
+        if (h2.t > 0.0) { rad = h.alb * reflHitRad(ro2 + R2 * h2.t, h2, R2); }
+        else { rad = h.alb * reflSky(R2, rough); }
+      }
+    }
+  } else {
   // 1) Fast 1-Lipschitz midpoint empty-ball skip before BVH2 (disabled on Low/Very Low tiers)
   var hitBvh = false;
   var tBvh = cRange;
@@ -382,22 +418,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     hitDist = mh.t;
     rad = evalMoverHitRadiance(origin + R * mh.t, mh.n, mh.alb, R);
   }
+  }
 
   if (orbT < hitDist) {
     hitAny = true;
     hitDist = orbT;
     rad = u.emissiveCol.rgb * 1.8;
   }
-  if (!hitAny) {
-    // Clean studio sky gradient + 3-point softbox/sun specular lobes on open ceiling / exterior miss
-    let skyT = clamp(R.z * 0.5 + 0.5, 0.0, 1.0);
-    let sDir = normalize(u.sunDir.xyz);
-    let sunDisc = pow(max(dot(R, sDir), 0.0), mix(36.0, 5.0, rough)) * vec3<f32>(2.8, 2.5, 2.1);
-    let keyBox = pow(max(dot(R, normalize(vec3<f32>(0.55, -0.62, 0.56))), 0.0), mix(10.0, 3.0, rough)) * vec3<f32>(1.15, 1.08, 0.98);
-    let rimBox = pow(max(dot(R, normalize(vec3<f32>(-0.72, -0.35, 0.58))), 0.0), mix(8.0, 3.0, rough)) * vec3<f32>(0.65, 0.82, 1.05);
-    let softBox = smoothstep(0.35, 0.92, R.z) * vec3<f32>(0.48, 0.54, 0.64);
-    rad = mix(vec3<f32>(0.22, 0.24, 0.28), vec3<f32>(0.62, 0.72, 0.88), skyT) + sunDisc + keyBox + rimBox + softBox;
-  }
+  if (!hitAny) { rad = reflSky(R, rough); }
 
   let normDist = clamp(hitDist / 6.0, 0.05, 1.0);
   textureStore(outRefl, q, vec4<f32>(rad, normDist));

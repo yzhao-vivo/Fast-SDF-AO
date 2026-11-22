@@ -14,7 +14,8 @@
 
 export const MAX_MOVERS = 8;
 export const MOVER_STRIDE_FLOATS = 64; // 2 x mat4 + 8 x vec4 = 256 B per instance
-export const MOVER_UBO_BYTES = 16 + MAX_MOVERS * MOVER_STRIDE_FLOATS * 4;
+export const MOVER_HEADER_FLOATS = 16; // count/mode/flags + static-scene BLAS frame
+export const MOVER_UBO_BYTES = MOVER_HEADER_FLOATS * 4 + MAX_MOVERS * MOVER_STRIDE_FLOATS * 4;
 export const MOVER_KIND_BVH = 0;
 export const MOVER_KIND_SPHERE = 1; // analytic unit sphere in local space (exact, no BLAS)
 export const MOVER_SDF_RES = 64;    // baked local SDF resolution per mesh (64^3 FP16 = 512 KiB)
@@ -39,7 +40,10 @@ struct Mover {
   sdfAlb: vec4<f32>,   // baked-SDF mode: rgb=mesh mean albedo x tint (no per-triangle colors in an SDF)
 };
 struct MoverU {
-  count: vec4<u32>,    // x=active movers, y=mode (0=exact BVH, 1=baked SDF)
+  count: vec4<u32>,    // x=active movers, y=mode (0=exact BVH, 1=baked SDF), z=1: exact static-scene reflections
+  stat: vec4<u32>,     // static-scene BLAS: x=root node, y=1 if the root is one leaf
+  statQMin: vec4<f32>, // static-scene BLAS quantization origin (world space)
+  statQScale: vec4<f32>,
   m: array<Mover, ${MAX_MOVERS}>,
 };
 @group(0) @binding(${binding}) var<uniform> mv: MoverU;
@@ -64,6 +68,8 @@ struct MvHit {
   t: f32,         // world distance along the ray (< 0 on miss)
   n: vec3<f32>,   // world-space geometric normal, flipped to face the ray
   alb: vec3<f32>, // albedo at the hit: instance tint x per-triangle color
+  metal: f32,     // 1 for a metal (mirror-like) surface
+  mover: f32,     // 1 for a moving object, 0 for the static scene
 };
 
 fn mvBox(nd: vec4<u32>, qInv: vec3<f32>, qOff: vec3<f32>, tMax: f32) -> f32 {
@@ -106,26 +112,26 @@ fn mvLeaf(leafInfo: u32, o: vec3<f32>, d: vec3<f32>, tMin: f32, bestT: ptr<funct
   return hit;
 }
 
-// Closest (or any, when anyHit) triangle hit of mover i's BLAS for a local-space ray. Returns t or -1.
-fn mvBLAS(i: u32, o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32, anyHit: bool, bestTri: ptr<function, u32>) -> f32 {
-  let info = mv.m[i].info;
+// Closest (or any, when anyHit) triangle hit of the BLAS rooted at node "root" (quantized with qMin/qScale) for a
+// ray in that BLAS's space. Returns t or -1.
+fn mvBLASAt(root: u32, single: bool, qMin: vec3<f32>, qScale: vec3<f32>, o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32, anyHit: bool, bestTri: ptr<function, u32>) -> f32 {
   let inv = vec3<f32>(1.0) / vec3<f32>(
     select(d.x, 1e-12, abs(d.x) < 1e-12),
     select(d.y, 1e-12, abs(d.y) < 1e-12),
     select(d.z, 1e-12, abs(d.z) < 1e-12)
   );
-  let qInv = mv.m[i].qScale.xyz * inv;
-  let qOff = (mv.m[i].qMin.xyz - o) * inv;
+  let qInv = qScale * inv;
+  let qOff = (qMin - o) * inv;
   var bestT = tMax;
   var found = false;
-  if (info.z == 1u) {
-    let nd = mvNodes[info.y];
+  if (single) {
+    let nd = mvNodes[root];
     if (mvBox(nd, qInv, qOff, bestT) >= 0.0) { found = mvLeaf(nd.w, o, d, tMin, &bestT, bestTri); }
     return select(-1.0, bestT, found);
   }
   var stack: array<u32, 32>;
   var sp = 0u;
-  var pair = info.y;
+  var pair = root;
   for (var visit = 0u; visit < 4096u; visit++) {
     let ndL = mvNodes[pair];
     let ndR = mvNodes[pair + 1u];
@@ -164,6 +170,12 @@ fn mvBLAS(i: u32, o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32, anyHit: bool
   return select(-1.0, bestT, found);
 }
 
+// Mover i's BLAS for a ray already in its local space.
+fn mvBLAS(i: u32, o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32, anyHit: bool, bestTri: ptr<function, u32>) -> f32 {
+  let info = mv.m[i].info;
+  return mvBLASAt(info.y, info.z == 1u, mv.m[i].qMin.xyz, mv.m[i].qScale.xyz, o, d, tMin, tMax, anyHit, bestTri);
+}
+
 // Entering hit of the local unit sphere. Origins inside the sphere (its own tessellated surface,
 // whose faces sit slightly inside the analytic sphere) never report a hit, so no self-occlusion.
 fn mvSphereLocal(lo: vec3<f32>, ld: vec3<f32>, tMin: f32, tMax: f32) -> f32 {
@@ -192,7 +204,7 @@ fn mvMayHit(i: u32, o: vec3<f32>, d: vec3<f32>, tMax: f32) -> bool {
 // Closest exact hit over all mover instances for a unit-length world ray within (tMin, tMax).
 // Always a miss in baked-SDF mode, where movers live in the distance field instead.
 fn traceMovers(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> MvHit {
-  var best = MvHit(-1.0, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0));
+  var best = MvHit(-1.0, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0), 0.0, 1.0);
   if (mv.count.y != 0u) { return best; }
   var tCur = tMax;
   let cnt = min(mv.count.x, ${MAX_MOVERS}u);
@@ -205,7 +217,7 @@ fn traceMovers(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> MvHit {
       let t = mvSphereLocal(lo, ld, tMin, tCur);
       if (t > 0.0) {
         tCur = t;
-        best = MvHit(t, mvNormalToWorld(i, lo + ld * t), mv.m[i].colRough.rgb);
+        best = MvHit(t, mvNormalToWorld(i, lo + ld * t), mv.m[i].colRough.rgb, mvMetal(i, 1.0), 1.0);
       }
     } else {
       var tri = 0u;
@@ -215,12 +227,67 @@ fn traceMovers(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> MvHit {
         let a = mvTris[tri];
         let b = mvTris[tri + 1u];
         let c = mvTris[tri + 2u];
-        best = MvHit(t, mvNormalToWorld(i, cross(b.xyz, c.xyz)), mv.m[i].colRough.rgb * vec3<f32>(a.w, b.w, c.w));
+        // Per-triangle albedo; a negative red lane marks a metal triangle (see buildMoverBLAS callers)
+        best = MvHit(t, mvNormalToWorld(i, cross(b.xyz, c.xyz)), mv.m[i].colRough.rgb * abs(vec3<f32>(a.w, b.w, c.w)), mvMetal(i, a.w), 1.0);
       }
     }
   }
   if (best.t > 0.0 && dot(best.n, d) > 0.0) { best.n = -best.n; }
   return best;
+}
+
+// Metal: the instance's roughness override when it has one, else the triangle's metal mark (red < 0).
+fn mvMetal(i: u32, triRed: f32) -> f32 {
+  if (mv.m[i].info.w != 0u) { return select(0.0, 1.0, mv.m[i].colRough.a < 0.0); }
+  return select(0.0, 1.0, triRed < 0.0);
+}
+
+// Exact closest hit on the static scene's triangle BLAS (exact reflections). Miss when disabled.
+fn traceStatic(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> MvHit {
+  var best = MvHit(-1.0, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0), 0.0, 0.0);
+  if (mv.count.z == 0u) { return best; }
+  var tri = 0u;
+  let t = mvBLASAt(mv.stat.x, mv.stat.y == 1u, mv.statQMin.xyz, mv.statQScale.xyz, o, d, tMin, tMax, false, &tri);
+  if (t > 0.0) {
+    let a = mvTris[tri];
+    let b = mvTris[tri + 1u];
+    let c = mvTris[tri + 2u];
+    var n = normalize(cross(b.xyz, c.xyz));
+    if (dot(n, d) > 0.0) { n = -n; }
+    best = MvHit(t, n, abs(vec3<f32>(a.w, b.w, c.w)), select(0.0, 1.0, a.w < 0.0), 0.0);
+  }
+  return best;
+}
+
+// Baked-SDF mover mode: sphere-trace only the movers' distance fields (exact reflections still need to
+// see them while the static scene is hit exactly).
+fn traceMoversSdf(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> MvHit {
+  var best = MvHit(-1.0, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0), 0.0, 1.0);
+  if (!mvSdfMode()) { return best; }
+  var t = tMin;
+  for (var k = 0u; k < 64u; k++) {
+    let p = o + d * t;
+    let c = mvSdfClosest(p, 1e4);
+    if (c.y < 0.0) { break; }
+    if (c.x < 0.01) {
+      let i = u32(c.y);
+      best = MvHit(t, mvSdfNormal(i, p, d), mv.m[i].sdfAlb.rgb, mvMetal(i, 1.0), 1.0);
+      break;
+    }
+    t += max(c.x, 0.008);
+    if (t > tMax) { break; }
+  }
+  return best;
+}
+
+// Closest exact hit over the static scene and the movers (in either mover mode).
+fn traceScene(o: vec3<f32>, d: vec3<f32>, tMin: f32, tMax: f32) -> MvHit {
+  var h = traceStatic(o, d, tMin, tMax);
+  let lim = select(tMax, h.t, h.t > 0.0);
+  var hm = traceMovers(o, d, tMin, lim);
+  if (hm.t < 0.0) { hm = traceMoversSdf(o, d, tMin, lim); }
+  if (hm.t > 0.0) { h = hm; }
+  return h;
 }
 
 // Any-hit shadow/visibility query against all mover instances (never occludes in baked-SDF mode).
