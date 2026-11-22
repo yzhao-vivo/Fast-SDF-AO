@@ -41,6 +41,7 @@ canvas{display:block;width:100%;height:auto}
     <button data-scene="atrium" aria-pressed="false">Atrium (Curved)</button>
     <button data-scene="archive" aria-pressed="false">Archive (Boxes)</button>
     <button data-scene="stress" aria-pressed="false" title="Curved Atrium + 8 movers, ~266k moving triangles (Stanford dragon 202k)">Stress test (8 movers)</button>
+    <button data-scene="sponza" aria-pressed="false" title="Dabrovic Sponza (66k tris) with the 202k-tri Stanford dragon walking the courtyard">Sponza + dragon</button>
     <button id="load-btn" style="border-color:#38bdf8;color:#bae6fd">Load .glb / .obj</button>
     <input id="file-in" type="file" accept=".glb,.gltf,.obj" style="display:none">
     <select id="quality" aria-label="Quality">
@@ -89,7 +90,7 @@ import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { buildContactBVH } from './contact-bvh.js';
 import { WebGPUFastSDFAO, WEBGPU_QUALITY_PRESETS } from './src/webgpu.js';
-import { addStressMeshes, stressMovers, STRESS_CAMERA } from './assets/mover-stress-scene.js';
+import { addStressMeshes, stressMovers, STRESS_CAMERA, loadSponzaScene, sponzaMovers } from './assets/mover-stress-scene.js';
 
 const statusEl = document.querySelector('#status');
 const errEl = document.querySelector('#err');
@@ -202,6 +203,7 @@ try {
   function updateMovers(t) {
     if (!moversOn) { gpu.dynObjects = []; return; }
     if (moverLayout === 'stress' && stressSet) { gpu.dynObjects = stressMovers(stressSet, t); return; }
+    if (moverLayout === 'sponza' && stressSet && sceneCache.sponza) { gpu.dynObjects = sponzaMovers(stressSet, sceneCache.sponza.meta, t); return; }
     // Three movers phase-locked 120 degrees apart on one collision-free elevated orbit around the pedestal
     const a1 = t * 1.05, a2 = a1 + (2 * Math.PI) / 3, a3 = a1 + (4 * Math.PI) / 3;
     const orbit = (a, h, dh) => [1.80 * Math.cos(a), -0.15 + 1.36 * Math.sin(a), h + dh * Math.sin(a * 2.0)];
@@ -220,7 +222,9 @@ try {
   async function loadSceneData(name) {
     if (sceneCache[name]) return sceneCache[name];
     statusEl.value = `Loading ${name} mesh, FP16 SDF & SAH Contact BVH…`;
-    if (name === 'gallery') {
+    if (name === 'sponza') {
+      sceneCache[name] = await loadSponzaScene(buildContactBVH);
+    } else if (name === 'gallery') {
       const [mod, sdfHalf] = await Promise.all([
         import('./assets/gallery-scene.js'),
         fetchGzipHalf('./assets/gallery.f16.gz'),
@@ -287,10 +291,11 @@ try {
   function stressMoverTris() {
     if (!stressSet) return 0;
     const st = stressSet.stats;
+    if (moverLayout === 'sponza') return st.dragon.triangles + st.bunny.triangles + st.teapot.triangles;
     return st.dragon.triangles + 2 * st.bunny.triangles + st.plate.triangles + st.teapot.triangles + st.knot.triangles + st.ring.triangles;
   }
   async function selectScene(name) {
-    const stress = name === 'stress';
+    const stress = name === 'stress', sponza = name === 'sponza';
     activeScene = name;
     document.querySelectorAll('button[data-scene]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.scene === name)));
     const sc = await loadSceneData(stress ? 'atrium' : name);
@@ -302,16 +307,16 @@ try {
     controls.target.set(...cam.target);
     controls.update();
     let extra = '';
-    if (stress) {
+    moverLayout = stress ? 'stress' : (sponza ? 'sponza' : 'gallery');
+    if (stress || sponza) {
       if (!stressSet) {
         statusEl.value = 'Loading the stress-test meshes (Stanford dragon 202k tris, bunny) and building their BVHs…';
         stressSet = await addStressMeshes(gpu);
       }
       moversOn = true;
       document.querySelector('#movers').checked = true;
-      extra = ` · 8 movers, ${stressMoverTris().toLocaleString()} moving tris`;
+      extra = ` · ${sponza ? 4 : 8} movers, ${stressMoverTris().toLocaleString()} moving tris`;
     }
-    moverLayout = stress ? 'stress' : 'gallery';
     updateMovers(simTime);
     const info = gpu.adapterInfo;
     const devLabel = info.description || info.architecture || info.vendor || 'WebGPU';
@@ -407,7 +412,7 @@ try {
     const meta = {
       device: info.description || info.architecture || info.vendor || 'WebGPU',
       scene: activeScene, quality: gpu.quality, resolution: `${gpu.width}×${gpu.height}`, warmup, frames,
-      movers: activeScene === 'stress' ? `8 movers, ${stressMoverTris().toLocaleString()} moving tris` : `${gpu.activeMoverCount || 3} movers`,
+      movers: (activeScene === 'stress' || activeScene === 'sponza') ? `${activeScene === 'sponza' ? 4 : 8} movers, ${stressMoverTris().toLocaleString()} moving tris` : `${gpu.activeMoverCount || 3} movers`,
     };
     const base = rows[1];
     const fmt = (v) => Number.isFinite(v) ? v.toFixed(2) : '—';
@@ -643,6 +648,7 @@ try {
     setMoverTracing,
     runBenchmark,
     getStressSet: () => stressSet,
+    getStaticSceneData: () => sceneCache[activeScene === 'stress' ? 'atrium' : activeScene],
     setMovers: (on, t = 0.6) => {
       moversOn = !!on;
       document.querySelector('#movers').checked = moversOn;

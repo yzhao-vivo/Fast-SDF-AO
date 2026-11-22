@@ -4,6 +4,10 @@
 // plate over the bunny, and the analytic gold mirror sphere. Used by webgpu.html ("Stress test") and
 // benchmark/bench_movers.cjs. The scanned meshes (Stanford 3D Scanning Repository) are generated
 // locally by benchmark/build-stress-meshes.cjs.
+//
+// The "Sponza + dragon" scene: the Dabrovic Sponza (66k static tris, unsigned 12 cm SDF) with the 202k-tri
+// dragon walking the courtyard, a gold mirror sphere, a chrome bunny in flight and a teapot in the arcade.
+// Built locally by benchmark/build_sponza.py (Sponza by Marko Dabrovic, non-commercial use with credit).
 import * as T from 'three';
 import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { composeMat4 } from '../src/webgpu.js';
@@ -19,16 +23,24 @@ export const STRESS_MESH_URLS = {
   bunny: './assets/stress/stanford-bunny.b64.txt',
 };
 
-// base64(gzip([u32 nVerts, u32 nTris, f32 xyz..., u32 abc...])), see benchmark/build-stress-meshes.cjs
-async function loadPackedMesh(url) {
+export const SPONZA_URLS = {
+  meta: './assets/stress/sponza.json',
+  mesh: './assets/stress/sponza-mesh.b64.txt',
+  sdf: './assets/stress/sponza-sdf.b64.txt',
+};
+
+async function fetchB64Gzip(url, howToBuild) {
   const resp = await fetch(url);
-  if (!resp.ok) {
-    throw Error(`Missing ${url}. Run "npm i --no-save bunny@1.0.1 stanford-dragon@1.1.1 && node benchmark/build-stress-meshes.cjs" first.`);
-  }
+  if (!resp.ok) throw Error(`Missing ${url}. ${howToBuild}`);
   const bin = atob((await resp.text()).trim());
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  const raw = await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+  return new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+}
+
+// base64(gzip([u32 nVerts, u32 nTris, f32 xyz..., u32 abc...])), see benchmark/build-stress-meshes.cjs
+async function loadPackedMesh(url) {
+  const raw = await fetchB64Gzip(url, 'Run "npm i --no-save bunny@1.0.1 stanford-dragon@1.1.1 && node benchmark/build-stress-meshes.cjs" first.');
   const dv = new DataView(raw);
   const nv = dv.getUint32(0, true), nt = dv.getUint32(4, true);
   return {
@@ -104,5 +116,55 @@ export function stressMovers({ ids, halfZ }, t) {
     { pos: orbit(Math.PI, 1.3, 0.2), radius: 0.3, color: [0.98, 0.80, 0.36], roughness: -0.04 },
     { mesh: ids.ring, matrix: M(orbit(Math.PI / 2, 1.9, 0.12), t * 0.9, 0.5, 0), color: [0.85, 0.65, 0.30], roughness: -0.3 },
     { mesh: ids.bunny, matrix: M(orbit(1.5 * Math.PI, 1.25, 0.15), 0, 0, -t, 0.42 / 0.55), color: [0.92, 0.93, 0.95], roughness: -0.05 },
+  ];
+}
+
+// ---- Sponza + dragon ----
+const SPONZA_HOWTO = 'Run "npm i --no-save jp.keijiro.dabrovic-sponza@1.0.0 && python3 benchmark/build_sponza.py" first.';
+
+// Static scene data for gpu.loadScene(): mesh, unsigned FP16 SDF and the contact BVH.
+export async function loadSponzaScene(buildContactBVH, urls = SPONZA_URLS) {
+  const metaResp = await fetch(urls.meta);
+  if (!metaResp.ok) throw Error(`Missing ${urls.meta}. ${SPONZA_HOWTO}`);
+  const meta = await metaResp.json();
+  const [mesh, sdf] = await Promise.all([fetchB64Gzip(urls.mesh, SPONZA_HOWTO), fetchB64Gzip(urls.sdf, SPONZA_HOWTO)]);
+  const dv = new DataView(mesh);
+  const nv = dv.getUint32(0, true), nt = dv.getUint32(4, true);
+  let o = 16;
+  const take = (Ctor, n) => { const a = new Ctor(mesh, o, n); o += n * 4; return a; };
+  const data = {
+    positions: take(Float32Array, nv * 3),
+    normals: take(Float32Array, nv * 3),
+    colors: take(Float32Array, nv * 3),
+    roughness: take(Float32Array, nv),
+    indices: take(Uint32Array, nt * 3),
+  };
+  const g = new T.BufferGeometry();
+  g.setAttribute('position', new T.BufferAttribute(data.positions, 3));
+  g.setIndex(new T.BufferAttribute(data.indices, 1));
+  const v = meta.voxel;
+  const contactRange = Math.max(0.18, 0.12 + 0.5 * Math.hypot(v, v, v));
+  const bvh = buildContactBVH([new T.Mesh(g)], T, { gridSize: 'auto', range: contactRange + 0.0005 });
+  return {
+    ...data, sdfHalf: new Uint16Array(sdf), sdfDims: meta.sdfDims, sdfMin: meta.sdfMin, sdfSpan: meta.sdfSpan,
+    bvh, contactRange, cam: meta.camera, useGI: true, meta,
+  };
+}
+
+// Dragon (3 m) walking a loop down the courtyard between the column rows, facing where it walks; a gold
+// mirror sphere floating above it, a chrome bunny flying at gallery height, a teapot in the shaded arcade.
+export function sponzaMovers({ ids, halfZ }, meta, t) {
+  const M = (pos, rx, ry, rz, s = 1) => composeMat4(pos, quatFromEuler(rx, ry, rz), s);
+  const floor = meta.floorZ;
+  const sd = 3.0 / 1.25, sb = 1.2 / 0.55, st = 1.0 / 0.6;
+  const th = 0.22 * t;
+  const heading = Math.atan2(0.6 * Math.cos(th), -8.5 * Math.sin(th));
+  const a = 0.35 * t + 1.0, b = 0.3 * t;
+  return [
+    // The scanned dragon's head points along local -x, hence the half turn to face its walking direction
+    { mesh: ids.dragon, matrix: M([8.5 * Math.cos(th), 0.6 * Math.sin(th), floor + halfZ.dragon * sd], 0, 0, heading + Math.PI, sd), color: [0.30, 0.72, 0.52], roughness: 0.45 },
+    { pos: [6.0 * Math.cos(a), 1.0 * Math.sin(a), 3.4], radius: 0.8, color: [0.98, 0.80, 0.36], roughness: -0.04 },
+    { mesh: ids.bunny, matrix: M([-6.0 * Math.cos(b), 1.1 * Math.sin(b), 5.2], 0, 0, -0.5 * t, sb), color: [0.92, 0.93, 0.95], roughness: -0.05 },
+    { mesh: ids.teapot, matrix: M([4.5, -5.0, floor + halfZ.teapot * st], 0, 0, 0.6 * t, st), color: [0.95, 0.55, 0.20], roughness: 0.5 },
   ];
 }

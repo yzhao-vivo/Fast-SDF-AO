@@ -115,8 +115,8 @@ f = lambda v, d=4: '—' if v is None else f'{v:.{d}f}'
 mB, mS = metrics['modes']['bvh'], metrics['modes']['sdf']
 lines = [
     '# Moving-object benchmark: Exact BVH vs Baked SDF (original)', '',
-    f"Scene: curved Atrium ({run['triangles']['static']:,} static tris) + 8 movers ({int(run['triangles']['movers']):,} moving tris, "
-    f"incl. the 202k-tri Stanford dragon). {setup['width']}×{setup['height']}, `{setup['quality']}` preset, "
+    f"Scene: {run.get('sceneLabel', 'curved Atrium + 8 movers')}; {int(run['triangles']['static']):,} static tris, "
+    f"{int(run['triangles']['movers']):,} moving tris. {setup['width']}×{setup['height']}, `{setup['quality']}` preset, "
     f"{run['frames']} converged frames per mode, movers frozen at t = {run['pose']}. Device: {setup['device']}"
     + (' (SwiftShader, CPU-emulated WebGPU)' if run.get('swiftshader') else '') + '.', '',
     f"Reference: `tools/trace_gi`, 512 cosine rays + 64 solar-disk shadow rays per pixel on the exact world-space triangles, "

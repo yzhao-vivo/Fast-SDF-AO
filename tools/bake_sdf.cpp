@@ -23,6 +23,8 @@
 //   bake_sdf --boxes archive.json --lo -1 -1 -1 --span 26 18 8 --res 128 --clip 1.5 --out archive.f32
 // Check:   --validate K compares K random voxels with brute force (every triangle or point, and the
 //          winding number of every triangle); any mismatch exits 1. --seed S picks the voxels and samples.
+// Unsigned: --unsigned skips the sign pass (distances only) for meshes that are not closed, e.g. scanned or
+//          architectural models whose holes would make the winding number wrong in whole voxel columns.
 // Options: --threads N  --block B (0 disables culling)  --reach r (AO reach; distances past r + 1 voxel diagonal are not resolved)  --search bvh-neighbour|bvh|grid  --cell metres  --subdiv n (boxes)  --stats file.json
 // Build:   c++ -O3 -std=c++17 -pthread bake_sdf.cpp -o bake_sdf    (no dependencies)
 #include <algorithm>
@@ -568,7 +570,7 @@ static uint16_t floatToHalf(float f){
 }
 
 int main(int argc,char** argv){
-    std::string boxes,obj,points,writePoints,out,brickOut,statsPath,search="bvh-neighbour"; int subdiv=1; size_t sample=0,validate=0; uint64_t seed=1; double cellOverride=0; V3 lo{0,0,0},span{0,0,0}; int RX=128,RY=128,RZ=128,block=8,threads=int(std::max(1u,std::thread::hardware_concurrency())); double clip=1.5,reach=0; bool writeF16=false;
+    std::string boxes,obj,points,writePoints,out,brickOut,statsPath,search="bvh-neighbour"; int subdiv=1; size_t sample=0,validate=0; uint64_t seed=1; double cellOverride=0; V3 lo{0,0,0},span{0,0,0}; int RX=128,RY=128,RZ=128,block=8,threads=int(std::max(1u,std::thread::hardware_concurrency())); double clip=1.5,reach=0; bool writeF16=false,unsignedField=false;
     for(int i=1;i<argc;++i){
         std::string a=argv[i]; auto need=[&](int n){if(i+n>=argc)throw std::runtime_error("missing value for "+a);};
         if(a=="--boxes"){need(1);boxes=argv[++i];}
@@ -581,6 +583,7 @@ int main(int argc,char** argv){
         else if(a=="--out"){need(1);out=argv[++i];}
         else if(a=="--brick-out"){need(1);brickOut=argv[++i];}
         else if(a=="--f16"){writeF16=true;}
+        else if(a=="--unsigned"){unsignedField=true;}
         else if(a=="--stats"){need(1);statsPath=argv[++i];}
         else if(a=="--lo"){need(3);for(int k=0;k<3;++k)lo[k]=std::atof(argv[++i]);}
         else if(a=="--span"){need(3);for(int k=0;k<3;++k)span[k]=std::atof(argv[++i]);}
@@ -596,7 +599,7 @@ int main(int argc,char** argv){
         else throw std::runtime_error("unknown option "+a);
     }
     if(int(!boxes.empty())+int(!obj.empty())+int(!points.empty())!=1||(sample&&!points.empty())||(!writePoints.empty()&&!sample)||out.empty()||RX<2||RY<2||RZ<2||RX>1024||RY>1024||RZ>1024||!(span[0]>0&&span[1]>0&&span[2]>0)||!(clip>0))
-        {std::cerr<<"Usage: bake_sdf (--boxes f.json | --obj f.obj | --points f.ply) --lo x y z --span x y z --out field.f32 [--res 128 | --res-xyz nx ny nz] [--f16] [--brick-out b.bin] [--clip 1.5] [--threads N] [--block 8] [--validate K]\n";return 2;}
+        {std::cerr<<"Usage: bake_sdf (--boxes f.json | --obj f.obj | --points f.ply) --lo x y z --span x y z --out field.f32 [--res 128 | --res-xyz nx ny nz] [--f16] [--brick-out b.bin] [--clip 1.5] [--unsigned] [--threads N] [--block 8] [--validate K]\n";return 2;}
     if(block&&(RX%block||RY%block||RZ%block)){std::cerr<<"--res-xyz must be multiples of --block\n";return 2;}
 
     // One more worker than --threads (at least 2) for the parallel phases, when the machine has the core.
@@ -622,7 +625,7 @@ int main(int argc,char** argv){
     // The sign pass only needs the triangles: it runs on its own thread alongside the BVH build and
     // the distance pass, which write unsigned distances; inside voxels are negated at the end.
     std::vector<uint8_t> inside; double tSign=0;
-    std::thread signThread([&]{if(pointMode)return;auto ts=Clk::now();inside=insideMask(tris,lo,span,RX,RY,RZ,1);tSign=since(ts);});
+    std::thread signThread([&]{if(pointMode||unsignedField)return;auto ts=Clk::now();inside=insideMask(tris,lo,span,RX,RY,RZ,1);tSign=since(ts);});
     t0=Clk::now(); BVH bvh(useGrid||pointMode?noTris:tris,std::max(threads,2));
     const std::vector<PF> onePoint{PF{0,0,0}}; PointCloud none; none.p=onePoint;
     PointBVH pbvh(pointMode?pc:none,work2); const double tBvh=since(t0);
@@ -744,7 +747,7 @@ int main(int argc,char** argv){
     const double tField=since(t0);
     // -float(d) is float(d) with the sign bit set, so this is bit-identical to signing per voxel.
     t0=Clk::now(); signThread.join(); const double tSignWait=since(t0);
-    if(!pointMode)for(size_t k=0;k<NV;++k)if(inside[k])field[k]=-field[k];
+    if(!pointMode&&!unsignedField)for(size_t k=0;k<NV;++k)if(inside[k])field[k]=-field[k];
     const double tTotal=since(total);
 
     // --validate K: K random voxels against brute force, after the timing. Meshes: distance to every
@@ -772,7 +775,7 @@ int main(int argc,char** argv){
                         const double w0=bx*cy-by*cx,w1=cx*ay-cy*ax,w2=ax*by-ay*bx;
                         if(!((w0>0&&w1>0&&w2>0)||(w0<0&&w1<0&&w2<0)))continue;
                         const double sw=w0+w1+w2; if((w0*tr.a[2]+w1*tr.b[2]+w2*tr.c[2])/sw<zc)w+=sw>0?-1:1;}
-                    neg=w!=0;
+                    neg=!unsignedField&&w!=0;
                 }
                 const double d=std::sqrt(best); const float mag=d<=limit?float(std::min(d,clip)):fclip, got=field[k];
                 if(std::fabs(got)!=mag)++vMis;
@@ -785,7 +788,7 @@ int main(int argc,char** argv){
     const bool vFail=vMis||vSign;
 
     std::ostringstream js; js<<std::fixed<<std::setprecision(3)
-      <<"{\"triangles\":"<<tris.size()<<",\"points\":"<<(pointMode?pc.p.size():0)<<",\"points_hidden\":"<<pc.hidden<<",\"signed\":"<<(pointMode&&!pc.oriented?"false":"true")<<",\"res\":["<<RX<<","<<RY<<","<<RZ<<"],\"f16\":"<<(writeF16?"true":"false")<<",\"clip\":"<<clip<<",\"threads\":"<<threads<<",\"block\":"<<block<<",\"search\":\""<<search<<"\""
+      <<"{\"triangles\":"<<tris.size()<<",\"points\":"<<(pointMode?pc.p.size():0)<<",\"points_hidden\":"<<pc.hidden<<",\"signed\":"<<((pointMode&&!pc.oriented)||unsignedField?"false":"true")<<",\"res\":["<<RX<<","<<RY<<","<<RZ<<"],\"f16\":"<<(writeF16?"true":"false")<<",\"clip\":"<<clip<<",\"threads\":"<<threads<<",\"block\":"<<block<<",\"search\":\""<<search<<"\""
       <<",\"grid_cell\":"<<grid.cell<<",\"ms\":{\"load\":"<<tLoad<<",\"grid\":"<<tGrid<<",\"bvh\":"<<tBvh<<",\"sign\":"<<tSign<<",\"sign_wait\":"<<tSignWait<<",\"distance\":"<<tField<<",\"total\":"<<tTotal<<"}"
       <<",\"limit\":"<<limit<<",\"blocks\":"<<NBX*NBY*NBZ<<",\"blocks_culled\":"<<culled<<",\"voxels_culled\":"<<voxCulled<<",\"distance_queries\":"<<queries<<",\"triangle_tests\":"<<tested;
     if(validate)js<<",\"validate\":{\"voxels\":"<<validate<<",\"mismatches\":"<<vMis<<",\"sign_errors\":"<<vSign<<",\"ms\":"<<tValidate<<"}";

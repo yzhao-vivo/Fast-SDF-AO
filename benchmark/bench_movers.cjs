@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // WebGPU moving-object benchmark: quality and cost of Exact BVH vs Baked SDF (original method) movers on
-// the stress scene (curved Atrium, 13.7k static tris + 8 movers, ~270k moving tris incl. the Stanford dragon).
+// --scene sponza (default: Dabrovic Sponza, 66k static tris, with the 202k-tri Stanford dragon walking the
+// courtyard + 3 more movers) or --scene stress (curved Atrium, 13.7k static tris + 8 movers, ~270k moving tris).
 //
 // Quality: freezes the movers, lets each mode converge, reads the renderer's final half-res AO / GI /
 // sun-shadow buffers and its G-buffer back from the GPU, and scores them against tools/trace_gi
@@ -8,10 +9,11 @@
 // A second reference without movers marks the pixels the movers change ("mover-affected").
 // Cost: runs the in-page benchmark of webgpu.html ("Run benchmark") with the movers animating.
 //
-// Setup:  npm i --no-save bunny@1.0.1 stanford-dragon@1.1.1 && node benchmark/build-stress-meshes.cjs
-// Run:    node benchmark/bench_movers.cjs [--frames 48] [--perf-warmup 30] [--perf-frames 120]
+// Setup:  npm i --no-save bunny@1.0.1 stanford-dragon@1.1.1 jp.keijiro.dabrovic-sponza@1.0.0
+//         node benchmark/build-stress-meshes.cjs && python3 benchmark/build_sponza.py
+// Run:    node benchmark/bench_movers.cjs [--scene sponza|stress] [--frames 48] [--perf-warmup 30] [--perf-frames 120]
 //           [--swiftshader] [--headed] [--channel chrome] [--three-dir node_modules/three]
-// Output: benchmark/mover-bench/ (raw buffers, references, metrics.json, report.md, images/*.png)
+// Output: benchmark/mover-bench/<scene>/ (raw buffers, references, metrics.json, report.md, images/*.png)
 // Needs Playwright (require('playwright')), a C++17 compiler, and python3 with numpy + Pillow.
 'use strict';
 const fs = require('fs');
@@ -21,14 +23,18 @@ const { execFileSync } = require('child_process');
 const { chromium } = require('playwright');
 
 const ROOT = path.resolve(__dirname, '..');
-const OUT = path.join(__dirname, 'mover-bench');
 const args = process.argv.slice(2);
 const opt = (name, def) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : def; };
+const SCENE = opt('scene', 'sponza');
+const SCENE_LABEL = { sponza: 'Dabrovic Sponza + 4 movers (walking Stanford dragon 202k tris, gold mirror sphere, chrome bunny, teapot)',
+  stress: 'curved Atrium + 8 movers (Stanford dragon 202k tris, bunnies, teapot, torus knot, thin ring, canopy, gold mirror sphere)' }[SCENE];
+if (!SCENE_LABEL) throw Error(`Unknown --scene ${SCENE}`);
+const OUT = path.join(__dirname, 'mover-bench', SCENE);
 const flag = (name) => args.includes(`--${name}`);
 const FRAMES = Number(opt('frames', 48));
 const PERF_WARMUP = Number(opt('perf-warmup', 30));
 const PERF_FRAMES = Number(opt('perf-frames', 120));
-const POSE_T = Number(opt('pose', 2.2));
+const POSE_T = Number(opt('pose', SCENE === 'sponza' ? 8.5 : 2.2));
 const SWIFTSHADER = flag('swiftshader');
 const THREE_DIR = opt('three-dir', null);
 
@@ -122,6 +128,20 @@ window.__bench = {
     return res;
   },
   // 15 floats per triangle (v0, v1, v2, unit normal, albedo) in world space, for tools/trace_gi
+  // Current scene's static triangles (positions, per-vertex colors averaged per triangle)
+  staticTriangles() {
+    const A = window.wgpuDemo.getStaticSceneData(), nt = A.indices.length / 3, out = new Float32Array(nt * 15);
+    for (let t = 0; t < nt; t++) {
+      const v = [A.indices[t * 3], A.indices[t * 3 + 1], A.indices[t * 3 + 2]];
+      const P = v.map(i => [A.positions[i * 3], A.positions[i * 3 + 1], A.positions[i * 3 + 2]]);
+      const e1 = P[1].map((x, k) => x - P[0][k]), e2 = P[2].map((x, k) => x - P[0][k]);
+      const n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+      const l = Math.hypot(...n) || 1;
+      const alb = [0, 1, 2].map(k => (A.colors[v[0] * 3 + k] + A.colors[v[1] * 3 + k] + A.colors[v[2] * 3 + k]) / 3);
+      out.set([...P[0], ...P[1], ...P[2], n[0] / l, n[1] / l, n[2] / l, ...alb], t * 15);
+    }
+    return this.b64(new Uint8Array(out.buffer));
+  },
   async moverTriangles() {
     const { composeMat4 } = await import('./src/webgpu.js');
     const g = window.wgpuDemo.gpu, out = [];
@@ -157,6 +177,9 @@ async function main() {
   if (!fs.existsSync(path.join(ROOT, 'assets/stress/stanford-dragon-202k.b64.txt'))) {
     throw Error('Missing stress meshes: npm i --no-save bunny@1.0.1 stanford-dragon@1.1.1 && node benchmark/build-stress-meshes.cjs');
   }
+  if (SCENE === 'sponza' && !fs.existsSync(path.join(ROOT, 'assets/stress/sponza.json'))) {
+    throw Error('Missing Sponza: npm i --no-save jp.keijiro.dabrovic-sponza@1.0.0 && python3 benchmark/build_sponza.py');
+  }
   const tracer = path.join(OUT, 'bin', 'trace_gi');
   console.log('Compiling tools/trace_gi.cpp…');
   execFileSync('c++', ['-O3', '-std=c++17', '-pthread', path.join(ROOT, 'tools/trace_gi.cpp'), '-o', tracer], { stdio: 'inherit' });
@@ -182,11 +205,11 @@ async function main() {
   await page.waitForFunction(() => window.wgpuDemo && window.wgpuDemo.gpu.sceneRes);
   await page.addScriptTag({ content: PAGE_HELPERS });
 
-  console.log('Loading the stress scene…');
-  const setup = await page.evaluate(async (t) => {
+  console.log(`Loading the ${SCENE} scene…`);
+  const setup = await page.evaluate(async ({ t, scene }) => {
     const D = window.wgpuDemo, g = D.gpu;
     D.stopLoop();
-    await D.selectScene('stress');
+    await D.selectScene(scene);
     D.setMovers(true, t);
     for (let i = 0; i < 2; i++) { D.renderOnce(); await g.device.queue.onSubmittedWorkDone(); } // finish the SDF bakes
     const meshes = [...g.moverMeshes.values()].map(m => ({ id: m.id, triangles: m.triangles, sdfBakeMs: m.sdfBakeMs ?? null,
@@ -194,8 +217,9 @@ async function main() {
     const info = g.adapterInfo;
     return { device: info.description || info.architecture || info.vendor || 'WebGPU', hasTimestamp: g.hasTimestamp,
       sunDir: g.sunDir, stats: D.getStressSet().stats, meshes, width: g.width, height: g.height, aoW: g.aoW, aoH: g.aoH,
-      quality: g.quality, atlasBytes: g.moverSdfAtlas.width * g.moverSdfAtlas.height * g.moverSdfAtlas.depthOrArrayLayers * 2 };
-  }, POSE_T);
+      quality: g.quality, atlasBytes: g.moverSdfAtlas.width * g.moverSdfAtlas.height * g.moverSdfAtlas.depthOrArrayLayers * 2,
+      movers: g.activeMoverCount, status: document.querySelector('#status').value };
+  }, { t: POSE_T, scene: SCENE });
   console.log(`  ${setup.device}, timestamps: ${setup.hasTimestamp}`);
 
   // ---- Quality: converge each mode on the frozen pose, then read back ----
@@ -231,20 +255,9 @@ async function main() {
   // ---- Reference: exact world-space triangles (static Atrium + posed movers) ----
   console.log('Exporting triangles…');
   const moverTris = Buffer.from(await page.evaluate(() => window.__bench.moverTriangles()), 'base64');
-  const { buildAtriumGeometryData } = await import(require('url').pathToFileURL(path.join(ROOT, 'assets/atrium-scene.js')).href);
-  const A = buildAtriumGeometryData();
-  const st = new Float32Array(A.triangleCount * 15);
-  for (let t = 0; t < A.triangleCount; t++) {
-    const vs = [0, 1, 2].map(k => A.indices[t * 3 + k]);
-    const P = vs.map(v => [A.positions[v * 3], A.positions[v * 3 + 1], A.positions[v * 3 + 2]]);
-    const e1 = P[1].map((x, k) => x - P[0][k]), e2 = P[2].map((x, k) => x - P[0][k]);
-    const n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
-    const l = Math.hypot(...n) || 1;
-    const alb = [0, 1, 2].map(k => vs.reduce((s, v) => s + A.colors[v * 3 + k], 0) / 3);
-    st.set([...P[0], ...P[1], ...P[2], n[0] / l, n[1] / l, n[2] / l, ...alb], t * 15);
-  }
-  fs.writeFileSync(path.join(OUT, 'tris_static.f32'), Buffer.from(st.buffer));
-  fs.writeFileSync(path.join(OUT, 'tris_full.f32'), Buffer.concat([Buffer.from(st.buffer), moverTris]));
+  const staticTris = Buffer.from(await page.evaluate(() => window.__bench.staticTriangles()), 'base64');
+  fs.writeFileSync(path.join(OUT, 'tris_static.f32'), staticTris);
+  fs.writeFileSync(path.join(OUT, 'tris_full.f32'), Buffer.concat([staticTris, moverTris]));
 
   // Samples = valid G-buffer pixels (identical rasterization in both modes)
   const readF32 = (f) => { const b = fs.readFileSync(path.join(OUT, f)); return new Float32Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.length)); };
@@ -271,8 +284,8 @@ async function main() {
   console.log(`Timing (${PERF_WARMUP} warm-up + ${PERF_FRAMES} frames per condition)…`);
   const perf = await page.evaluate(({ warmup, frames }) => window.wgpuDemo.runBenchmark({ warmup, frames }), { warmup: PERF_WARMUP, frames: PERF_FRAMES });
 
-  fs.writeFileSync(path.join(OUT, 'run.json'), JSON.stringify({ setup, perf, frames: FRAMES, pose: POSE_T, stride: STRIDE,
-    triangles: { static: A.triangleCount, movers: moverTris.length / 60 }, swiftshader: SWIFTSHADER, logs }, null, 2));
+  fs.writeFileSync(path.join(OUT, 'run.json'), JSON.stringify({ scene: SCENE, sceneLabel: SCENE_LABEL, setup, perf, frames: FRAMES, pose: POSE_T, stride: STRIDE,
+    triangles: { static: staticTris.length / 60, movers: moverTris.length / 60 }, swiftshader: SWIFTSHADER, logs }, null, 2));
   await browser.close();
   server.close();
   console.log('Scoring…');
