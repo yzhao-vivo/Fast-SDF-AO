@@ -31,6 +31,8 @@ Options:
   --f16                    Write IEEE-754 binary16 (half-float, 2 bytes/voxel)
   --clip D                 Clamp distances to [-D, +D] (default: 1.5)
   --unsigned               Distances only, no sign (for meshes that are not closed)
+  --sign z|vote            Sign by the +z winding number (default) or by the majority of the +x/+y/+z
+                           winding numbers, robust to holes in nearly closed meshes (e.g. architecture)
   --reach R                Skip resolving voxels beyond R + 1 voxel diagonal
   --brick-out FILE         Write 2-level sparse narrow-band 8^3 brick map
   --threads N              Worker thread count (default: all cores)

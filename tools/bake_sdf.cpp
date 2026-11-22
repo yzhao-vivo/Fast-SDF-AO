@@ -25,6 +25,9 @@
 //          winding number of every triangle); any mismatch exits 1. --seed S picks the voxels and samples.
 // Unsigned: --unsigned skips the sign pass (distances only) for meshes that are not closed, e.g. scanned or
 //          architectural models whose holes would make the winding number wrong in whole voxel columns.
+// Vote:    --sign vote takes the sign by majority of the winding numbers along +x, +y and +z rays, so a hole
+//          that corrupts the columns of one axis is outvoted by the other two (nearly closed meshes such as
+//          architecture). Default --sign z is the single +z winding number.
 // Options: --threads N  --block B (0 disables culling)  --reach r (AO reach; distances past r + 1 voxel diagonal are not resolved)  --search bvh-neighbour|bvh|grid  --cell metres  --subdiv n (boxes)  --stats file.json
 // Build:   c++ -O3 -std=c++17 -pthread bake_sdf.cpp -o bake_sdf    (no dependencies)
 #include <algorithm>
@@ -554,6 +557,31 @@ static std::vector<uint8_t> insideMask(const std::vector<Tri>& t,const V3& lo,co
     return in;
 }
 
+// Majority of the +z, +x and +y winding signs. The x and y passes reuse insideMask on cyclically rotated
+// coordinates ((x,y,z) -> (y,z,x) and (z,x,y) are rotations, so triangle orientation is preserved).
+static std::vector<uint8_t> insideMaskVote(const std::vector<Tri>& t,const V3& lo,const V3& span,int RX,int RY,int RZ,int threads){
+    auto rot=[](const V3& v,int r){return r==1?V3{v[1],v[2],v[0]}:V3{v[2],v[0],v[1]};};
+    std::vector<uint8_t> vz,vx,vy;
+    auto pass=[&](int r,std::vector<uint8_t>& out){
+        std::vector<Tri> tr; tr.reserve(t.size());
+        for(const Tri& x:t)tr.emplace_back(rot(x.a,r),rot(x.b,r),rot(x.c,r),x.comp);
+        const int R[3]={RX,RY,RZ};
+        const int A=r==1?1:2,B=r==1?2:0,C=r==1?0:1; // rotated axis order
+        out=insideMask(tr,rot(lo,r),rot(span,r),R[A],R[B],R[C],threads);
+    };
+    std::thread tz([&]{vz=insideMask(t,lo,span,RX,RY,RZ,threads);});
+    std::thread tx([&]{pass(1,vx);});   // ray along x: rotated (y,z,x), dims (RY,RZ,RX)
+    pass(2,vy);                          // ray along y: rotated (z,x,y), dims (RZ,RX,RY)
+    tz.join(); tx.join();
+    std::vector<uint8_t> in(size_t(RX)*RY*RZ,0);
+    for(int k=0;k<RZ;++k)for(int j=0;j<RY;++j)for(int i=0;i<RX;++i){
+        const size_t id=(size_t(k)*RY+j)*RX+i;
+        const int votes=vz[id]+vx[(size_t(i)*RZ+k)*RY+j]+vy[(size_t(j)*RX+i)*RZ+k];
+        in[id]=votes>=2;
+    }
+    return in;
+}
+
 static uint16_t floatToHalf(float f){
     uint32_t u; std::memcpy(&u,&f,4);
     uint32_t sign=(u>>16)&0x8000u;
@@ -570,7 +598,7 @@ static uint16_t floatToHalf(float f){
 }
 
 int main(int argc,char** argv){
-    std::string boxes,obj,points,writePoints,out,brickOut,statsPath,search="bvh-neighbour"; int subdiv=1; size_t sample=0,validate=0; uint64_t seed=1; double cellOverride=0; V3 lo{0,0,0},span{0,0,0}; int RX=128,RY=128,RZ=128,block=8,threads=int(std::max(1u,std::thread::hardware_concurrency())); double clip=1.5,reach=0; bool writeF16=false,unsignedField=false;
+    std::string boxes,obj,points,writePoints,out,brickOut,statsPath,search="bvh-neighbour"; int subdiv=1; size_t sample=0,validate=0; uint64_t seed=1; double cellOverride=0; V3 lo{0,0,0},span{0,0,0}; int RX=128,RY=128,RZ=128,block=8,threads=int(std::max(1u,std::thread::hardware_concurrency())); double clip=1.5,reach=0; bool writeF16=false,unsignedField=false,signVote=false;
     for(int i=1;i<argc;++i){
         std::string a=argv[i]; auto need=[&](int n){if(i+n>=argc)throw std::runtime_error("missing value for "+a);};
         if(a=="--boxes"){need(1);boxes=argv[++i];}
@@ -584,6 +612,7 @@ int main(int argc,char** argv){
         else if(a=="--brick-out"){need(1);brickOut=argv[++i];}
         else if(a=="--f16"){writeF16=true;}
         else if(a=="--unsigned"){unsignedField=true;}
+        else if(a=="--sign"){need(1);const std::string m=argv[++i];if(m=="vote")signVote=true;else if(m!="z")throw std::runtime_error("--sign must be z or vote");}
         else if(a=="--stats"){need(1);statsPath=argv[++i];}
         else if(a=="--lo"){need(3);for(int k=0;k<3;++k)lo[k]=std::atof(argv[++i]);}
         else if(a=="--span"){need(3);for(int k=0;k<3;++k)span[k]=std::atof(argv[++i]);}
@@ -599,7 +628,7 @@ int main(int argc,char** argv){
         else throw std::runtime_error("unknown option "+a);
     }
     if(int(!boxes.empty())+int(!obj.empty())+int(!points.empty())!=1||(sample&&!points.empty())||(!writePoints.empty()&&!sample)||out.empty()||RX<2||RY<2||RZ<2||RX>1024||RY>1024||RZ>1024||!(span[0]>0&&span[1]>0&&span[2]>0)||!(clip>0))
-        {std::cerr<<"Usage: bake_sdf (--boxes f.json | --obj f.obj | --points f.ply) --lo x y z --span x y z --out field.f32 [--res 128 | --res-xyz nx ny nz] [--f16] [--brick-out b.bin] [--clip 1.5] [--unsigned] [--threads N] [--block 8] [--validate K]\n";return 2;}
+        {std::cerr<<"Usage: bake_sdf (--boxes f.json | --obj f.obj | --points f.ply) --lo x y z --span x y z --out field.f32 [--res 128 | --res-xyz nx ny nz] [--f16] [--brick-out b.bin] [--clip 1.5] [--unsigned | --sign z|vote] [--threads N] [--block 8] [--validate K]\n";return 2;}
     if(block&&(RX%block||RY%block||RZ%block)){std::cerr<<"--res-xyz must be multiples of --block\n";return 2;}
 
     // One more worker than --threads (at least 2) for the parallel phases, when the machine has the core.
@@ -625,7 +654,7 @@ int main(int argc,char** argv){
     // The sign pass only needs the triangles: it runs on its own thread alongside the BVH build and
     // the distance pass, which write unsigned distances; inside voxels are negated at the end.
     std::vector<uint8_t> inside; double tSign=0;
-    std::thread signThread([&]{if(pointMode||unsignedField)return;auto ts=Clk::now();inside=insideMask(tris,lo,span,RX,RY,RZ,1);tSign=since(ts);});
+    std::thread signThread([&]{if(pointMode||unsignedField)return;auto ts=Clk::now();inside=signVote?insideMaskVote(tris,lo,span,RX,RY,RZ,1):insideMask(tris,lo,span,RX,RY,RZ,1);tSign=since(ts);});
     t0=Clk::now(); BVH bvh(useGrid||pointMode?noTris:tris,std::max(threads,2));
     const std::vector<PF> onePoint{PF{0,0,0}}; PointCloud none; none.p=onePoint;
     PointBVH pbvh(pointMode?pc:none,work2); const double tBvh=since(t0);
@@ -768,14 +797,22 @@ int main(int argc,char** argv){
                 if(pointMode){int bi=0; for(size_t m=0;m<pbvh.P.size();++m){const double d=pd2(p,pbvh.P[m]);if(d<best){best=d;bi=int(m);}} neg=pbvh.side(p,bi)<0;}
                 else{
                     for(const Tri& tr:tris)best=std::min(best,triDist2(p,tr));
-                    const double sx=span[0]/RX,sy=span[1]/RY,x=lo[0]+(i+.5)*sx+1.2345e-9*sx,y=lo[1]+(j+.5)*sy+2.7182e-9*sy,zc=lo[2]+(z+.5)*span[2]/RZ;
-                    int w=0;
-                    for(const Tri& tr:tris){
-                        const double ax=tr.a[0]-x,ay=tr.a[1]-y,bx=tr.b[0]-x,by=tr.b[1]-y,cx=tr.c[0]-x,cy=tr.c[1]-y;
-                        const double w0=bx*cy-by*cx,w1=cx*ay-cy*ax,w2=ax*by-ay*bx;
-                        if(!((w0>0&&w1>0&&w2>0)||(w0<0&&w1<0&&w2<0)))continue;
-                        const double sw=w0+w1+w2; if((w0*tr.a[2]+w1*tr.b[2]+w2*tr.c[2])/sw<zc)w+=sw>0?-1:1;}
-                    neg=!unsignedField&&w!=0;
+                    // Brute-force winding along one axis: ax0/ax1 span the column, ax2 is the ray axis.
+                    const int idx[3]={i,j,z}; const int R3[3]={RX,RY,RZ};
+                    auto wind=[&](int ax0,int ax1,int ax2){
+                        const double s0=span[ax0]/R3[ax0],s1=span[ax1]/R3[ax1];
+                        const double x=lo[ax0]+(idx[ax0]+.5)*s0+1.2345e-9*s0,y=lo[ax1]+(idx[ax1]+.5)*s1+2.7182e-9*s1,zc=lo[ax2]+(idx[ax2]+.5)*span[ax2]/R3[ax2];
+                        int w=0;
+                        for(const Tri& tr:tris){
+                            const double ax=tr.a[ax0]-x,ay=tr.a[ax1]-y,bx=tr.b[ax0]-x,by=tr.b[ax1]-y,cx=tr.c[ax0]-x,cy=tr.c[ax1]-y;
+                            const double w0=bx*cy-by*cx,w1=cx*ay-cy*ax,w2=ax*by-ay*bx;
+                            if(!((w0>0&&w1>0&&w2>0)||(w0<0&&w1<0&&w2<0)))continue;
+                            const double sw=w0+w1+w2; if((w0*tr.a[ax2]+w1*tr.b[ax2]+w2*tr.c[ax2])/sw<zc)w+=sw>0?-1:1;}
+                        return w!=0;
+                    };
+                    if(unsignedField)neg=false;
+                    else if(signVote)neg=int(wind(0,1,2))+int(wind(1,2,0))+int(wind(2,0,1))>=2;
+                    else neg=wind(0,1,2);
                 }
                 const double d=std::sqrt(best); const float mag=d<=limit?float(std::min(d,clip)):fclip, got=field[k];
                 if(std::fabs(got)!=mag)++vMis;

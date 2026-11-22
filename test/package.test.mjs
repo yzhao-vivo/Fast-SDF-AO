@@ -190,6 +190,18 @@ try {
   assert.equal(stats.validate.sign_errors, 0);
   assert.equal(fs.statSync(outPath).size, 32 * 32 * 32 * 2);
   console.log(`   OK (32^3 FP16 bake in ${stats.ms.total.toFixed(1)} ms, 200/200 brute-force exact)`);
+
+  // --sign vote (majority of +x/+y/+z winding numbers) must equal the +z sign on a closed mesh
+  const votePath = path.join(tmpDir, 'octa-vote.f16');
+  const voteOut = execFileSync('node', [
+    path.join(repoRoot, 'bin/bake-sdf.mjs'), '--obj', objPath, '--lo', '-2', '-2', '-2', '--span', '4', '4', '4',
+    '--res', '32', '--f16', '--sign', 'vote', '--validate', '200', '--out', votePath,
+  ], { encoding: 'utf8' });
+  const voteStats = JSON.parse(voteOut.trim());
+  assert.equal(voteStats.validate.mismatches, 0);
+  assert.equal(voteStats.validate.sign_errors, 0);
+  assert.ok(fs.readFileSync(votePath).equals(fs.readFileSync(outPath)), '--sign vote differs from --sign z on a closed mesh');
+  console.log('   OK (--sign vote identical to the +z winding sign on a closed mesh)');
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 }

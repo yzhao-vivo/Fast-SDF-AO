@@ -16,8 +16,14 @@ are frozen and each mode converges for 32–40 frames at 1280×720, `high` prese
 
 | Scene | Static | Movers |
 |---|---|---|
-| **Sponza + dragon** | Dabrovic Sponza, 66,444 tris, unsigned 12 cm SDF | 202k-tri Stanford dragon walking the courtyard (3 m), gold mirror sphere (analytic), chrome bunny, teapot: 222k moving tris |
+| **Sponza + dragon** | Dabrovic Sponza, 66,444 tris, 12 cm SDF (see note below) | 202k-tri Stanford dragon walking the courtyard (3 m), gold mirror sphere (analytic), chrome bunny, teapot: 222k moving tris |
 | **Stress test** | curved Atrium, 13,704 tris, 11.6 cm SDF | 8 movers: dragon 202k, 2 bunnies, teapot, torus knot, 1.2 cm thin ring, open canopy plate, gold mirror sphere: 270k moving tris |
+
+Sponza note: the numbers below were measured with the first Sponza build, an *unsigned* SDF (the model has
+3.5% open edges) and the textured stone floor. Unsigned distances never reach zero between voxel centres, so
+SDF rays (mirror reflections, far GI, the static part of shadows) could pass through surfaces; this affected
+both mover methods equally. `build_sponza.py` now bakes a signed field with `bake_sdf --sign vote` (majority
+of the +x/+y/+z winding numbers, robust to the holes) and gives the floor the gold mirror material.
 
 ## Quality
 

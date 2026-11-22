@@ -6,10 +6,12 @@
 
 Writes into assets/stress/ (gitignored; the model is not redistributed here):
   sponza-mesh.b64.txt  base64(gzip([u32 nVerts, nTris, 1, 1], f32 xyz, f32 normal, f32 rgb albedo, f32 roughness, u32 abc))
-  sponza-sdf.b64.txt   base64(gzip(FP16 distance field)), unsigned: the model is not closed (3.5% open edges)
+  sponza-sdf.b64.txt   base64(gzip(FP16 signed distance field)); the model is not closed (3.5% open edges), so the
+                       sign is the majority of the +x/+y/+z winding numbers (bake_sdf --sign vote)
   sponza.json          SDF bounds/dims, camera, floor height, triangle count
 Z-up metres (the OBJ is Y-up metres). Albedo per material = linear average of its diffuse texture; smooth
-normals with a 40-degree crease. Sponza: Marko Dabrovic (cgtechniques.com, 2002); UVs and fixes by Kenzie
+normals with a 40-degree crease. --floor gold-mirror (default) gives the courtyard floor the gold mirror
+sphere's material (albedo 0.98/0.80/0.36, roughness -0.04 = metal); --floor stone keeps the textured stone. Sponza: Marko Dabrovic (cgtechniques.com, 2002); UVs and fixes by Kenzie
 Lamar (Vicarious Visions); free for non-commercial use with attribution.
 """
 import argparse
@@ -30,6 +32,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--pkg', default=str(ROOT / 'node_modules' / 'jp.keijiro.dabrovic-sponza'))
 ap.add_argument('--voxel', type=float, default=0.12)
 ap.add_argument('--out', default=str(ROOT / 'assets' / 'stress'))
+ap.add_argument('--floor', choices=('gold-mirror', 'stone'), default='gold-mirror')
+ap.add_argument('--sign', choices=('vote', 'z', 'unsigned'), default='vote')
 a = ap.parse_args()
 src = Path(a.pkg) / 'DabrovicSponza'
 out = Path(a.out)
@@ -55,6 +59,9 @@ for line in (src / 'sponza.mtl').read_text(errors='ignore').splitlines():
             lin = np.where(px <= 0.04045, px / 12.92, ((px + 0.055) / 1.055) ** 2.4)
             albedo[mat] = [float(x) for x in lin.reshape(-1, 3).mean(0)]
 roughness = {m: (0.35 if m == 'sp_00_pod' else 0.8) for m in albedo}  # polished floor, matte stone elsewhere
+if a.floor == 'gold-mirror':  # same material as the gold mirror sphere mover (negative roughness = metal)
+    albedo['sp_00_pod'] = [0.98, 0.80, 0.36]
+    roughness['sp_00_pod'] = -0.04
 
 # ---- geometry ----
 V, tris, tmat = [], [], []
@@ -126,8 +133,9 @@ with open(obj_tmp, 'w') as f:
     f.writelines(f'v {x:.6f} {y:.6f} {z:.6f}\n' for x, y, z in P)
     f.writelines(f'f {i + 1} {j + 1} {k + 1}\n' for i, j, k in T)
 cmd = ['node', str(ROOT / 'bin' / 'bake-sdf.mjs'), '--obj', str(obj_tmp), '--lo', *map(str, sdf_min), '--span', *map(str, span),
-       '--res-xyz', *map(str, dims), '--clip', '1.5', '--unsigned', '--f16', '--validate', '400', '--out', str(f16_tmp)]
-print('Baking', 'x'.join(map(str, dims)), f'unsigned SDF ({vox * 100:.0f} cm voxels)…', flush=True)
+       '--res-xyz', *map(str, dims), '--clip', '1.5', *(['--unsigned'] if a.sign == 'unsigned' else ['--sign', a.sign]),
+       '--f16', '--validate', '400', '--out', str(f16_tmp)]
+print('Baking', 'x'.join(map(str, dims)), f'SDF, sign: {a.sign} ({vox * 100:.0f} cm voxels)…', flush=True)
 stats = json.loads(subprocess.check_output(cmd, text=True).strip().splitlines()[-1])
 raw = f16_tmp.read_bytes()
 assert len(raw) == dims[0] * dims[1] * dims[2] * 2, 'unexpected SDF size'
@@ -137,7 +145,7 @@ f16_tmp.unlink()
 
 meta = {
     'triangles': nt, 'vertices': nv, 'boundsMin': lo.tolist(), 'boundsMax': hi.tolist(), 'floorZ': floor_z,
-    'sdfMin': sdf_min, 'sdfSpan': span, 'sdfDims': dims, 'voxel': vox, 'unsigned': True,
+    'sdfMin': sdf_min, 'sdfSpan': span, 'sdfDims': dims, 'voxel': vox, 'sign': a.sign, 'floor': a.floor,
     'bake': {'ms': stats['ms']['total'], 'validate': stats.get('validate')},
     'camera': {'position': [-12.6, -1.4, 2.2], 'target': [1.5, 0.5, 2.4]},
     'credit': 'Sponza by Marko Dabrovic (cgtechniques.com, 2002); UVs and crack fixes by Kenzie Lamar (Vicarious Visions)',
