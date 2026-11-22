@@ -80,6 +80,29 @@ if (out / 'gpu_none_aogi.f32').exists():
             mag = np.abs(d_ref).mean(1) if d_ref.ndim == 2 else np.abs(d_ref)
             em[q] = {'mae': float(err[m].mean()), 'ref_effect': float(mag[m].mean()),
                      'captured': float(1 - err[m].mean() / max(mag[m].mean(), 1e-9))}
+            # Same comparison on 8x8-pixel block means (same-surface pixels only): per-pixel Monte Carlo
+            # noise drops ~8x, so what remains is systematic error of the mover effect.
+            full_gpu = np.zeros((W * H,) + d_gpu.shape[1:], np.float64)
+            full_ref = np.zeros_like(full_gpu)
+            wgt = np.zeros(W * H)
+            full_gpu[valid[same]] = d_gpu[same]
+            full_ref[valid[same]] = d_ref[same]
+            wgt[valid[same]] = 1
+            bw, bh = W // 8, H // 8
+            def blocks(a):
+                a = a[: bh * 8 * W].reshape(bh * 8, W, -1)[:, : bw * 8]
+                return a.reshape(bh, 8, bw, 8, -1).sum((1, 3))
+            n = blocks(wgt[:, None])[..., 0]
+            bg, br = blocks(full_gpu.reshape(W * H, -1)), blocks(full_ref.reshape(W * H, -1))
+            ok = n >= 16
+            bg, br = bg[ok] / n[ok, None], br[ok] / n[ok, None]
+            thr = {'ao': 0.02, 'gi': 0.01, 'sun': 0.05}[q]
+            sig = np.abs(br).mean(1) > thr
+            if sig.any():
+                berr = np.abs(bg - br).mean(1)[sig].mean()
+                bmag = np.abs(br).mean(1)[sig].mean()
+                em[q].update({'block_blocks': int(sig.sum()), 'block_mae': float(berr), 'block_ref_effect': float(bmag),
+                              'block_captured': float(1 - berr / max(bmag, 1e-9))})
         metrics['effect']['modes'][mode] = em
 
 
@@ -160,6 +183,15 @@ if 'effect' in metrics:
         lines.append(f"| {name} ({metrics['effect']['pixels'][q]:,} px) | {f(eB[q]['ref_effect'])} | **{f(eB[q]['mae'])}** | {f(eS[q]['mae'])} | "
                      f"{eB[q]['captured'] * 100:.0f}% | {eS[q]['captured'] * 100:.0f}% |")
     lines.append('')
+    if all('block_mae' in eB[q] and 'block_mae' in eS[q] for q in ('ao', 'sun', 'gi')):
+        lines += ['8×8-pixel block means of the same quantities (per-pixel noise averaged out; blocks with ≥16 same-surface pixels and a '
+                  'reference effect above 0.02 AO / 0.05 sun / 0.01 GI):', '',
+                  '| Metric | Blocks | Reference effect | Exact BVH error | Baked SDF error | Exact BVH captured | Baked SDF captured |',
+                  '|---|---:|---:|---:|---:|---:|---:|']
+        for q, name in (('ao', 'AO'), ('sun', 'Sun visibility'), ('gi', 'GI bounce (linear RGB)')):
+            lines.append(f"| {name} | {eB[q]['block_blocks']} | {f(eB[q]['block_ref_effect'])} | **{f(eB[q]['block_mae'])}** | {f(eS[q]['block_mae'])} | "
+                         f"{eB[q]['block_captured'] * 100:.0f}% | {eS[q]['block_captured'] * 100:.0f}% |")
+        lines.append('')
 perf = run['perf']
 lines += ['## Cost (median per frame, movers animating)', '', perf['markdown'], '']
 lines += ['## Build cost', '', '| Mesh | Triangles | Exact BVH: CPU build (ms) | BVH memory (MiB) | Baked SDF: GPU bake (ms) |', '|---|---:|---:|---:|---:|']

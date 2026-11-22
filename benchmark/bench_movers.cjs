@@ -36,6 +36,9 @@ const PERF_WARMUP = Number(opt('perf-warmup', 30));
 const PERF_FRAMES = Number(opt('perf-frames', 120));
 const POSE_T = Number(opt('pose', SCENE === 'sponza' ? 8.5 : 2.2));
 const SWIFTSHADER = flag('swiftshader');
+// --retrace: keep the previous run's GPU captures and timings, re-export the posed triangles and re-trace
+// the references only (e.g. after changing the reference geometry export).
+const RETRACE = flag('retrace');
 const THREE_DIR = opt('three-dir', null);
 
 // Headless SwiftShader cannot present to a canvas: render into an offscreen texture instead.
@@ -163,9 +166,15 @@ window.__bench = {
           push(X(...v), X(v[0] + t[o12 + 4], v[1] + t[o12 + 5], v[2] + t[o12 + 6]), X(v[0] + t[o12 + 8], v[1] + t[o12 + 9], v[2] + t[o12 + 10]),
             [tint[0] * t[o12 + 3], tint[1] * t[o12 + 7], tint[2] * t[o12 + 11]]);
         }
-      } else { // analytic sphere: finely tessellated for the reference
-        const U = 160, V = 80, P = (i, j) => { const th = 2 * Math.PI * i / U, ph = Math.PI * j / V; return X(Math.sin(ph) * Math.cos(th), Math.sin(ph) * Math.sin(th), Math.cos(ph)); };
-        for (let j = 0; j < V; j++) for (let i = 0; i < U; i++) { push(P(i, j), P(i, j + 1), P(i + 1, j + 1), tint); push(P(i, j), P(i + 1, j + 1), P(i + 1, j), tint); }
+      } else {
+        // Analytic sphere: the reference uses exactly the tessellation the G-buffer rasterizes (48 x 28,
+        // makeUnitSphereMesh), so primary samples lie on reference triangles. A finer sphere would put
+        // them up to r * (1 - cos(pi / 28)) inside it and make every reference AO ray hit it.
+        const U = 48, V = 28, P = (i, j) => { const th = 2 * Math.PI * i / U, ph = Math.PI * j / V; return X(Math.sin(ph) * Math.cos(th), Math.sin(ph) * Math.sin(th), Math.cos(ph)); };
+        for (let j = 0; j < V; j++) for (let i = 0; i < U; i++) {
+          if (j > 0) push(P(i, j), P(i, j + 1), P(i + 1, j), tint);
+          if (j < V - 1) push(P(i + 1, j), P(i, j + 1), P(i + 1, j + 1), tint);
+        }
       }
     }
     return this.b64(new Uint8Array(new Float32Array(out).buffer));
@@ -224,7 +233,9 @@ async function main() {
 
   // ---- Quality: converge each mode on the frozen pose, then read back ----
   const STRIDE = 2;
-  for (const mode of ['bvh', 'sdf']) {
+  const previous = RETRACE ? JSON.parse(fs.readFileSync(path.join(OUT, 'run.json'), 'utf8')) : null;
+  if (previous) Object.assign(setup, { capW: previous.setup.capW, capH: previous.setup.capH });
+  for (const mode of RETRACE ? [] : ['bvh', 'sdf']) {
     console.log(`Converging ${mode} (${FRAMES} frames)…`);
     const t0 = Date.now();
     const cap = await page.evaluate(async ({ mode, frames, stride }) => {
@@ -254,8 +265,8 @@ async function main() {
 
   // Same pose without movers (and, like the mover runs, without the SHaRC cache): subtracting it isolates
   // each method's mover effect from the renderer's own static-scene bias.
-  console.log(`Converging without movers (${FRAMES} frames)…`);
-  const none = await page.evaluate(async ({ frames, stride, t }) => {
+  if (!RETRACE) console.log(`Converging without movers (${FRAMES} frames)…`);
+  const none = RETRACE ? {} : await page.evaluate(async ({ frames, stride, t }) => {
     const D = window.wgpuDemo, g = D.gpu, hash = g.useHash;
     D.setMovers(false, t);
     g.useHash = false;
@@ -297,10 +308,11 @@ async function main() {
   }
 
   // ---- Cost: in-page benchmark with the movers animating ----
-  console.log(`Timing (${PERF_WARMUP} warm-up + ${PERF_FRAMES} frames per condition)…`);
-  const perf = await page.evaluate(({ warmup, frames }) => window.wgpuDemo.runBenchmark({ warmup, frames }), { warmup: PERF_WARMUP, frames: PERF_FRAMES });
+  if (!RETRACE) console.log(`Timing (${PERF_WARMUP} warm-up + ${PERF_FRAMES} frames per condition)…`);
+  const perf = RETRACE ? previous.perf : await page.evaluate(({ warmup, frames }) => window.wgpuDemo.runBenchmark({ warmup, frames }), { warmup: PERF_WARMUP, frames: PERF_FRAMES });
+  if (RETRACE) Object.assign(setup, { meshes: previous.setup.meshes, stats: previous.setup.stats });
 
-  fs.writeFileSync(path.join(OUT, 'run.json'), JSON.stringify({ scene: SCENE, sceneLabel: SCENE_LABEL, setup, perf, frames: FRAMES, pose: POSE_T, stride: STRIDE,
+  fs.writeFileSync(path.join(OUT, 'run.json'), JSON.stringify({ scene: SCENE, sceneLabel: SCENE_LABEL, setup, perf, frames: RETRACE ? previous.frames : FRAMES, pose: POSE_T, stride: STRIDE,
     triangles: { static: staticTris.length / 60, movers: moverTris.length / 60 }, swiftshader: SWIFTSHADER, logs }, null, 2));
   await browser.close();
   server.close();
